@@ -37,7 +37,8 @@ The workflow IDs below are stable identifiers; the names displayed in ComfyUI ar
 | --- | --- |
 | `H3OneClickSwapPlan` | Plan overlapping clips and character-swap prompts for up to four reference pictures. |
 | `H3AdvancedSwapPlan` | Add role labels and per-subject prompts for Advanced swaps. |
-| `H3ObjectSwapPlan` | Plan Change, Remove and Background edits. |
+| `H3ObjectSwapPlan` | Plan Change, Remove, Background and Add edits. |
+| `H3ObjectPlacementMask` | Build placement masks from normalized box keyframes for adding an object. |
 | `H3PeopleMask` | Build masks with per-person headroom and temporal holding. |
 | `H3GreyMannequins` | Make grey motion references that hide the original person's appearance. |
 | `H3ClipShots` | Find hard cuts and prepare shot-description frames. |
@@ -64,6 +65,14 @@ Use these nodes with Openjutsu's exported API workflows or wire them into a comp
 - Object edits use SAM tracks for the things to change, remove or preserve. `keep_outline` controls the Object plan's prompt; workflows also need to connect or remove the grey video reference accordingly.
 - Find people saves track data in ComfyUI's temporary directory. Run it again after a restart or a change to the source video, selected section or custom size.
 - Reusing the same source and plan settings produces the same run name for checkpoint-based resume in the surrounding workflow.
+
+## Adding an object
+
+In Openjutsu, choose **Object swap → Add**, describe the object and its location, and draw a box covering its full silhouette and contact shadow. For example, use `a chocolate cake on a plate` and `on the table`. An optional reference picture controls the new object's appearance.
+
+One placement keyframe keeps the editable area fixed on screen. For a moving camera, scrub to later frames and draw additional boxes; their positions and sizes are interpolated. This is manual placement animation, not automatic tracking. Draw new positions around cuts as needed. The model generates motion, perspective, lighting and occlusion within that editable area; results still depend on the source clip and prompt.
+
+The node's `placement` string is a JSON array of `{ "frame": 0, "x": 0.4, "y": 0.3, "width": 0.2, "height": 0.25 }` keyframes. Frames are relative to the selected video section at 24 fps; coordinates are fractions of the output canvas. Use the same JSON on the Object Swap Plan so moving the box invalidates resumed clips. Connect the original clip as the video reference and the placement mask to the masked-edit path. Add mode does not need SAM tracking.
 
 ## Models
 

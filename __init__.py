@@ -154,6 +154,40 @@ def build_prompt(descriptions, roles, length, overlap, only=None, lip_sync=True)
     return "\n".join(lines)
 
 
+SETTING_SHOTS = " Never describe the room, background or setting; the setting comes from a picture."
+
+
+def build_picture_prompt(desc, role, length, overlap, lip_sync=True):
+    """Whole frame from <Picture 1>: the person and the setting. No source video is shown; a depth control video holds the framing and poses."""
+    summary = ("[reference generation + audio reuse] The target video shows <Subject 1> in the setting of <Picture 1>, performing every action of %s "
+               "from the source clip with its framing, camera movement and timing. " % role)
+    if overlap:
+        summary += "Its first %.3f seconds are already-generated footage carried over from the preceding section. " % (overlap / FPS)
+    return "\n".join([
+        "subject_definitions:",
+        "<Subject 1> is the person from <Picture 1>. %sTheir face, hair, body and clothing all come from <Picture 1>." % (desc + " " if desc else ""),
+        "<Subject 2> is the setting, background people, props and lighting of <Picture 1>.",
+        "<Audio 1> is the synchronized original soundtrack of this %.3f-second section at 24 fps, reused unchanged as the complete final soundtrack." % (length / FPS),
+        "",
+        "summary:",
+        summary + "Identity, outfit and setting come from <Picture 1>.",
+        "",
+        "retention_analysis:",
+        "<Subject 1> (all shots): fully_preserved - the referenced facial identity, hair, skin tone and complete outfit remain consistent while poses and "
+        "mouth movements follow %s." % role,
+        "<Subject 2> (setting): fully_preserved - the location, lighting and atmosphere of <Picture 1> surround <Subject 1> in every shot.",
+        "<Audio 1>: fully_copy - the original synchronized soundtrack is the complete final audio, without additional generated vocals or sound effects.",
+        "",
+        "detailed_description:",
+        "Live-action footage in the setting of <Picture 1>, with natural skin tones and the lighting of <Picture 1>.",
+        SHOTS_PLACEHOLDER,
+        "<Subject 1> performs every action of %s: the same gestures, steps, gaze, expressions and mouth shapes at the same moments. %sContinue the "
+        "camera movement and performance through the last frame without adding transitions or changing speed." % (role, LIP_SYNC if lip_sync else NO_LIP_SYNC),
+        "",
+        SOUND,
+    ])
+
+
 class H3OneClickSwapPlan:
     @classmethod
     def INPUT_TYPES(cls):
@@ -195,7 +229,8 @@ class H3OneClickSwapPlan:
         return self.plan(source_frames, [picture_1, picture_2, picture_3, picture_4], [picture_1_text, picture_2_text, picture_3_text, picture_4_text],
                          clip_seconds, overlap_frames, short_edge or RESOLUTIONS[resolution], steps, seed, roles, video_people, no_lip_sync)[:5]
 
-    def plan(self, source_frames, pictures, texts, clip_seconds, overlap_frames, short_edge, steps, seed, roles, video_people, no_lip_sync):
+    def plan(self, source_frames, pictures, texts, clip_seconds, overlap_frames, short_edge, steps, seed, roles, video_people, no_lip_sync,
+             setting_from_picture=False):
         pictures = [p for p in pictures if p is not None]
         descriptions = []
         for i in range(len(pictures)):
@@ -207,15 +242,19 @@ class H3OneClickSwapPlan:
         people += ordinal_people(count)[len(people):]
         people = [split_person(p) for p in people[:count]]
         people_lines = "\n".join("<Subject %d>: %s" % (i, role + (" - " + looks if looks else "")) for i, (role, looks) in enumerate(people, 1))
-        shot_prompt = SHOTS_PROMPT % people_lines
+        shot_prompt = SHOTS_PROMPT % people_lines + SETTING_SHOTS * setting_from_picture
         # Gendered roles ("the woman") pull H3 toward the source person's gender when the grey figure is all it sees.
         people = [neutral_words(role) for role, _ in people]
 
         clips, out_w, out_h = plan_clips(source_frames, clip_seconds, overlap_frames, short_edge)
-        prompts = [build_prompt(descriptions, people, length, overlap, lip_sync=not no_lip_sync) for length, overlap in clips]
+        if setting_from_picture:
+            prompts = [build_picture_prompt(descriptions[0], people[0], length, overlap, not no_lip_sync) for length, overlap in clips]
+        else:
+            prompts = [build_prompt(descriptions, people, length, overlap, lip_sync=not no_lip_sync) for length, overlap in clips]
         subject_prompts = [[build_prompt(descriptions, people, length, overlap, k, not no_lip_sync) for k in range(1, count + 1)] for length, overlap in clips]
         # No lip-sync only joins the hash when on, so existing runs keep their names and resume.
-        run_name = "swap_" + run_hash(source_frames, pictures, [people, descriptions, clips, out_w, out_h, steps, seed] + ["no lip-sync"] * no_lip_sync)
+        run_name = ("picture_" if setting_from_picture else "swap_") + run_hash(
+            source_frames, pictures, [people, descriptions, clips, out_w, out_h, steps, seed] + ["no lip-sync"] * no_lip_sync)
         return (plan_json("swap", prompts, clips, overlap_frames, steps, seed), out_w, out_h, run_name, shot_prompt, people_lines,
                 json.dumps(subject_prompts))
 
@@ -270,6 +309,22 @@ class H3AdvancedSwapPlan(H3OneClickSwapPlan):
             people += ("\nThe people seen in the video, by look (their names may differ from the roles above):\n"
                        + "\n".join("- " + p for p in numbered_lines(video_people)))
         return out[:5] + (people,) + out[6:]
+
+
+class H3PictureSwapPlan(H3OneClickSwapPlan):
+    @classmethod
+    def INPUT_TYPES(cls):
+        types = super().INPUT_TYPES()
+        for name in ["picture_2", "picture_3", "picture_4", "picture_2_text", "picture_3_text", "picture_4_text"]:
+            del types["optional"][name]
+        return types
+
+    DESCRIPTION = "Like H3 One-Click Swap Plan, but the whole frame comes from the picture: its person and its setting. For a depth ControlNet run without a source video reference."
+
+    def build(self, source_frames, picture_1, clip_seconds, overlap_frames, resolution, steps, seed, roles,
+              picture_1_text="", video_people="", no_lip_sync=False, short_edge=0):
+        return self.plan(source_frames, [picture_1], [picture_1_text], clip_seconds, overlap_frames, short_edge or RESOLUTIONS[resolution],
+                         steps, seed, roles, video_people, no_lip_sync, setting_from_picture=True)[:5]
 
 
 MONTAGE_PASSES = 2
@@ -482,13 +537,41 @@ def build_edit_prompt(mode, thing, plural, change_to, picture, desc, length, ove
     return "\n".join(lines)
 
 
+def build_add_prompt(target, change_to, picture, desc, length, overlap):
+    new = "<Subject 1>" if picture else change_to
+    lines = ["subject_definitions:"]
+    if picture:
+        lines.append("<Subject 1> is the new object from <Picture 1>. %s" % desc)
+    lines += [
+        "<Video 1> is the original %.3f-second source clip at 24 fps. It supplies the camera movement, people, objects, setting and performance timing." % (length / FPS),
+        "<Audio 1> is the original synchronized soundtrack, reused unchanged.",
+        "", "summary:",
+        "[video editing + reference generation + audio reuse] Add %s %s inside the editable placement area. "
+        "Keep the existing surface and objects; this is an addition, not a replacement. Match the source perspective, lighting, contact shadows and camera movement." % (new, target),
+    ]
+    if change_to and picture:
+        lines[-1] += " The requested object is %s." % change_to
+    if overlap:
+        lines[-1] += " The first %.3f seconds already contain the added object from the previous clip; continue its appearance and position without introducing it again." % (overlap / FPS)
+    lines += [
+        "", "retention_analysis:",
+        "<Video 1>: partially_preserved - add the object only in the editable area. Preserve the people, original objects, camera, cuts and timing.",
+        "<Audio 1>: fully_copy - retain the complete original soundtrack.",
+        "", "detailed_description:", SHOTS_PLACEHOLDER,
+        "The added object remains physically grounded at its marked location throughout the clip. Preserve its identity, size and materials across frames. "
+        "Respect natural occlusion by existing people and objects. Keep the original scene outside the editable area unchanged. "
+        "Do not replace the supporting surface, add a scene transition or change playback speed.",
+        "", SOUND,
+    ]
+    return "\n".join(lines)
+
 class H3ObjectSwapPlan:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "source_frames": ("IMAGE", {"tooltip": "Source video frames at 24 fps."}),
-                "mode": (["change", "remove", "background"], {"default": "change", "tooltip": "change: the tracked thing gets a new look. remove: it is erased. background: the tracked thing stays and everything around it changes."}),
+                "mode": (["change", "remove", "background", "add"], {"default": "change", "tooltip": "change: replace the tracked thing. remove: erase it. background: change its surroundings. add: insert a new object inside a placement mask."}),
                 "target": ("STRING", {"default": "hair", "tooltip": "What SAM tracks, as the prompt names it: hair, jacket, car, or several separated by commas (hair, dress). For background, what stays (person)."}),
                 "change_to": ("STRING", {"multiline": True, "default": "", "tooltip": "What it becomes (short bright pink hair), or for remove what shows instead (optional)."}),
                 "clip_seconds": ("FLOAT", {"default": 6.0, "min": 2.5, "max": 15.0, "step": 0.1, "tooltip": "Longest clip per H3 generation, rounded down to the 17k+5 grid."}),
@@ -502,6 +585,7 @@ class H3ObjectSwapPlan:
                 "picture_1": ("IMAGE", {"tooltip": "What it should look like: an outfit, a hairstyle, a product or a place. Not used by remove."}),
                 "picture_1_text": ("STRING", {"forceInput": True}),
                 "short_edge": SHORT_EDGE,
+                "placement": ("STRING", {"default": "", "tooltip": "Add mode: the placement keyframes used by H3 Object Placement Mask. Included in the run name so moving the object starts a new run."}),
             },
         }
 
@@ -512,7 +596,7 @@ class H3ObjectSwapPlan:
     CATEGORY = "conditioning/minimax/context_loop"
     DESCRIPTION = "Splits a source video into overlapping H3 clips and writes the prompt for changing, removing or re-setting the tracked things."
 
-    def build(self, source_frames, mode, target, change_to, clip_seconds, overlap_frames, resolution, steps, seed, keep_outline=True, picture_1=None, picture_1_text="", short_edge=0):
+    def build(self, source_frames, mode, target, change_to, clip_seconds, overlap_frames, resolution, steps, seed, keep_outline=True, picture_1=None, picture_1_text="", short_edge=0, placement=""):
         parts = [re.sub(r"^(?:the|a|an)\s+", "", " ".join(p.split()), flags=re.I) for p in target.split(",")]
         parts = [p for p in parts if p] or ["person"]
         thing = "the " + (parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1])
@@ -522,12 +606,52 @@ class H3ObjectSwapPlan:
         if desc and not desc.endswith("."):
             desc += "."
         never = {"change": "Never mention %s." % thing, "remove": "Never mention %s." % thing,
-                 "background": "Say nothing about the location, background or setting."}[mode]
+                 "background": "Say nothing about the location, background or setting.",
+                 "add": "Describe the original scene and the placement surface. The new object is absent from these source frames; do not describe it as replacing anything."}[mode]
         clips, out_w, out_h = plan_clips(source_frames, clip_seconds, overlap_frames, short_edge or RESOLUTIONS[resolution])
-        prompts = [build_edit_prompt(mode, thing, len(parts) > 1, change_to, picture, desc, length, overlap, keep_outline) for length, overlap in clips]
+        prompts = [build_add_prompt(target, change_to, picture, desc, length, overlap) if mode == "add" else
+                   build_edit_prompt(mode, thing, len(parts) > 1, change_to, picture, desc, length, overlap, keep_outline) for length, overlap in clips]
         pictures = [picture_1] if picture else []
-        run_name = "edit_" + run_hash(source_frames, pictures, [mode, thing, change_to, desc, clips, out_w, out_h, steps, seed, keep_outline])
+        run_name = "edit_" + run_hash(source_frames, pictures, [mode, thing, change_to, desc, clips, out_w, out_h, steps, seed, keep_outline] + ([placement] if mode == "add" else []))
         return (plan_json("edit", prompts, clips, overlap_frames, steps, seed), out_w, out_h, run_name, EDIT_SHOTS_PROMPT % never)
+
+
+class H3ObjectPlacementMask:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"images": ("IMAGE",), "placement": ("STRING", {"multiline": True}),
+                             "start_frame": ("INT", {"default": 0, "min": 0, "max": 0x7fffffff})}}
+
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "build"
+    CATEGORY = "conditioning/minimax/context_loop"
+    DESCRIPTION = "An editable box per video frame, interpolated between normalized placement keyframes. One keyframe keeps the box fixed on screen."
+
+    def build(self, images, placement, start_frame=0):
+        points = sorted(json.loads(placement), key=lambda p: p["frame"])
+        if not points:
+            raise ValueError("Draw an object placement area first.")
+        for p in points:
+            if not isinstance(p["frame"], int) or any(not isinstance(p[k], (int, float)) or not math.isfinite(p[k]) for k in ("x", "y", "width", "height")):
+                raise ValueError("Placement keyframes need a frame number and finite normalized box coordinates.")
+            if not (0 <= p["x"] < 1 and 0 <= p["y"] < 1 and 0 < p["width"] <= 1 - p["x"] + 1e-6 and 0 < p["height"] <= 1 - p["y"] + 1e-6):
+                raise ValueError("The placement area must be inside the video frame.")
+        n, h, w = images.shape[:3]
+        scale = min(1.0, 256 / max(h, w))
+        mh, mw = max(1, round(h * scale)), max(1, round(w * scale))
+        mask = torch.zeros(n, mh, mw, device=comfy.model_management.intermediate_device())
+        j = 0
+        for i in range(n):
+            frame = start_frame + i
+            while j + 1 < len(points) and points[j + 1]["frame"] <= frame:
+                j += 1
+            a, b = points[j], points[min(j + 1, len(points) - 1)]
+            t = max(0.0, min(1.0, (frame - a["frame"]) / (b["frame"] - a["frame"]))) if b["frame"] != a["frame"] else 0.0
+            x, y, width, height = [a[k] + (b[k] - a[k]) * t for k in ("x", "y", "width", "height")]
+            left, top = int(x * mw), int(y * mh)
+            right, bottom = max(left + 1, math.ceil((x + width) * mw)), max(top + 1, math.ceil((y + height) * mh))
+            mask[i, top:bottom, left:right] = 1.0
+        return (mask,)
 
 
 FACE_OVERLAP = 24
@@ -1375,17 +1499,20 @@ class H3FillShots:
         return (prompt.replace(SHOTS_PLACEHOLDER, shots),)
 
 
-NODE_CLASS_MAPPINGS = {"H3OneClickSwapPlan": H3OneClickSwapPlan, "H3AdvancedSwapPlan": H3AdvancedSwapPlan, "H3GreyMannequins": H3GreyMannequins,
+NODE_CLASS_MAPPINGS = {"H3OneClickSwapPlan": H3OneClickSwapPlan, "H3AdvancedSwapPlan": H3AdvancedSwapPlan, "H3PictureSwapPlan": H3PictureSwapPlan, "H3GreyMannequins": H3GreyMannequins,
                        "H3PeopleMask": H3PeopleMask, "H3ClipShots": H3ClipShots, "H3FillShots": H3FillShots,
                        "H3TrackCrops": H3TrackCrops, "H3TrackRoles": H3TrackRoles, "H3RoleMask": H3RoleMask, "H3SubjectPrompt": H3SubjectPrompt,
                        "H3MontagePeople": H3MontagePeople, "H3MontagePlan": H3MontagePlan, "H3MontagePass": H3MontagePass,
-                       "H3MontageTracks": H3MontageTracks, "H3MontagePicks": H3MontagePicks, "H3ObjectSwapPlan": H3ObjectSwapPlan, "H3FaceChunks": H3FaceChunks, "H3FaceJoin": H3FaceJoin}
+                       "H3MontageTracks": H3MontageTracks, "H3MontagePicks": H3MontagePicks, "H3ObjectSwapPlan": H3ObjectSwapPlan,
+                       "H3ObjectPlacementMask": H3ObjectPlacementMask, "H3FaceChunks": H3FaceChunks, "H3FaceJoin": H3FaceJoin}
 NODE_DISPLAY_NAME_MAPPINGS = {"H3OneClickSwapPlan": "H3 One-Click Swap Plan", "H3AdvancedSwapPlan": "H3 Advanced Swap Plan (labelled roles)",
+                              "H3PictureSwapPlan": "H3 Picture Swap Plan (person + setting from the picture)",
                               "H3GreyMannequins": "H3 Grey Mannequins (hide people)", "H3PeopleMask": "H3 People Mask (headroom per person)",
                               "H3ClipShots": "H3 Clip Shots (find cuts)", "H3FillShots": "H3 Fill Shot List",
                               "H3TrackCrops": "H3 Track Crops (who is each track)", "H3TrackRoles": "H3 Track Roles (read labels)",
                               "H3RoleMask": "H3 Role Mask (labelled people only)", "H3SubjectPrompt": "H3 Subject Prompt (one pass per person)",
                               "H3MontagePeople": "H3 Montage People (save for the person list)", "H3MontagePlan": "H3 Montage Plan (labels, seed, size)",
                               "H3MontagePass": "H3 Montage Pass (this clip's person)", "H3MontageTracks": "H3 Montage Tracks (from Find people)", "H3MontagePicks": "H3 Montage Picks (no review)",
-                              "H3ObjectSwapPlan": "H3 Object Swap Plan (change, remove, background)",
+                              "H3ObjectSwapPlan": "H3 Object Swap Plan (change, remove, background, add)",
+                              "H3ObjectPlacementMask": "H3 Object Placement Mask (keyframed box)",
                               "H3FaceChunks": "H3 Face Fix Chunks", "H3FaceJoin": "H3 Face Fix Join"}
