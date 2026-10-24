@@ -551,20 +551,21 @@ def placement_words(placement):
     return "in the %s %s of the frame" % (row, col)
 
 
-def build_add_prompt(target, change_to, picture, desc, length, overlap, where):
-    """Describes the finished clip with the object in it, like the change prompt. A shot list of the bare surface and
-    "keep / do not replace" lines made H3 return the clip unchanged."""
+def build_add_prompt(target, change_to, picture, desc, length, overlap, where, action):
+    """Describes the finished clip with the new thing in it, like the change prompt without a reference video. A shot list
+    of the bare surface, "keep / do not replace" lines, or the original clip as <Video 1> (it shows the spot empty) all
+    made H3 return the clip unchanged. action replaces the still-object wording, for a dancer or rising steam."""
     new = "<Subject 1>" + (" (%s)" % change_to if change_to else "") if picture else change_to
     lines = ["subject_definitions:"]
     if picture:
-        lines.append(("<Subject 1> is the new object from <Picture 1>. %s" % desc).strip())
+        lines.append(("<Subject 1> is %s, from <Picture 1>. %s" % (change_to or "the new object", desc)).strip())
     lines += [
-        "<Video 1> is the source video for the target video edit, a %.3f-second section at 24 fps. It supplies the exact camera "
-        "framing, camera movement, people, performance timing and hard cuts." % (length / FPS),
-        "<Audio 1> is the synchronized original soundtrack supplied with <Video 1>, reused unchanged as the complete final soundtrack.",
+        "The source footage is a %.3f-second section at 24 fps. It supplies the exact camera framing, camera movement, people, "
+        "performance timing, setting and hard cuts, and its original soundtrack is reused unchanged." % (length / FPS),
         "", "summary:",
-        "[video editing + %saudio reuse] The target video is an edited version of <Video 1> in which %s is %s, %s, a real "
-        "object with contact shadows that match the source light and perspective. " % ("reference generation + " if picture else "", new, target, where),
+        "[video editing + %saudio reuse] The target video is an edited version of the source footage in which %s is %s, %s" % (
+            "reference generation + " if picture else "", new, target, where)
+        + (". %s " % action if action else ", a real object with contact shadows that match the source light and perspective. "),
     ]
     if overlap:
         lines[-1] += "Its first %.3f seconds are already-edited footage carried over from the preceding section, with it already in place. " % (overlap / FPS)
@@ -573,15 +574,16 @@ def build_add_prompt(target, change_to, picture, desc, length, overlap, where):
     if picture:
         lines.append("<Subject 1> (all shots): fully_preserved - its shape, colours, materials and details stay consistent in every frame.")
     lines += [
-        "<Video 1> (edited source): partially_preserved - the only change is %s %s; the people, actions, camera movement, shot "
-        "composition, cuts and timing are retained." % (new, target),
-        "<Audio 1>: fully_copy - the original synchronized soundtrack is the complete final audio, without additional "
+        "The source footage (edited source): partially_preserved - the only change is %s %s; the people, actions, camera movement, "
+        "shot composition, cuts and timing are retained." % (new, target),
+        "The soundtrack: fully_copy - the original synchronized soundtrack is the complete final audio, without additional "
         "generated vocals or sound effects.",
         "", "detailed_description:", "Live-action footage with the source lighting and lens perspective.", SHOTS_PLACEHOLDER,
+        "Throughout all shots, %s is %s, %s. %s" % (new, target, where, action) if action else
         "Throughout all shots, %s is clearly visible %s, %s, with the same size, identity and materials in every frame; people "
         "who move in front of it pass in front of it." % (new, target, where),
         "Continue the original camera movement and performance through the last frame without adding transitions or changing speed.",
-        "", SOUND,
+        "", SOUND.replace("<Audio 1>", "the source soundtrack"),
     ]
     return "\n".join(lines)
 
@@ -606,6 +608,7 @@ class H3ObjectSwapPlan:
                 "picture_1_text": ("STRING", {"forceInput": True}),
                 "short_edge": SHORT_EDGE,
                 "placement": ("STRING", {"default": "", "tooltip": "Add mode: the placement keyframes used by H3 Object Placement Mask. Included in the run name so moving the object starts a new run."}),
+                "action": ("STRING", {"multiline": True, "default": "", "tooltip": "Add mode, optional: what the new thing does or how it looks over the clip (she dances the same routine in sync with the others). Empty: a still object."}),
             },
         }
 
@@ -616,11 +619,14 @@ class H3ObjectSwapPlan:
     CATEGORY = "conditioning/minimax/context_loop"
     DESCRIPTION = "Splits a source video into overlapping H3 clips and writes the prompt for changing, removing or re-setting the tracked things."
 
-    def build(self, source_frames, mode, target, change_to, clip_seconds, overlap_frames, resolution, steps, seed, keep_outline=True, picture_1=None, picture_1_text="", short_edge=0, placement=""):
+    def build(self, source_frames, mode, target, change_to, clip_seconds, overlap_frames, resolution, steps, seed, keep_outline=True, picture_1=None, picture_1_text="", short_edge=0, placement="", action=""):
         parts = [re.sub(r"^(?:the|a|an)\s+", "", " ".join(p.split()), flags=re.I) for p in target.split(",")]
         parts = [p for p in parts if p] or ["person"]
         thing = "the " + (parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1])
         change_to = " ".join(change_to.split()).rstrip(".")
+        action = " ".join(action.split()) if mode == "add" else ""
+        if action and action[-1] not in ".!?":
+            action += "."
         if mode == "add":
             change_to = ADD_VERB.sub("", change_to)
         picture = picture_1 is not None and mode != "remove"
@@ -629,12 +635,12 @@ class H3ObjectSwapPlan:
             desc += "."
         never = {"change": "Never mention %s." % thing, "remove": "Never mention %s." % thing,
                  "background": "Say nothing about the location, background or setting.",
-                 "add": "Say nothing about what is or is not %s." % target}[mode]
+                 "add": "Say nothing about what is or is not %s, and do not count the people or objects." % target}[mode]
         clips, out_w, out_h = plan_clips(source_frames, clip_seconds, overlap_frames, short_edge or RESOLUTIONS[resolution])
-        prompts = [build_add_prompt(target, change_to, picture, desc, length, overlap, placement_words(placement)) if mode == "add" else
+        prompts = [build_add_prompt(target, change_to, picture, desc, length, overlap, placement_words(placement), action) if mode == "add" else
                    build_edit_prompt(mode, thing, len(parts) > 1, change_to, picture, desc, length, overlap, keep_outline) for length, overlap in clips]
         pictures = [picture_1] if picture else []
-        run_name = "edit_" + run_hash(source_frames, pictures, [mode, thing, change_to, desc, clips, out_w, out_h, steps, seed, keep_outline] + ([placement] if mode == "add" else []))
+        run_name = "edit_" + run_hash(source_frames, pictures, [mode, thing, change_to, desc, clips, out_w, out_h, steps, seed, keep_outline] + ([placement, action] if mode == "add" else []))
         return (plan_json("edit", prompts, clips, overlap_frames, steps, seed), out_w, out_h, run_name, EDIT_SHOTS_PROMPT % never)
 
 

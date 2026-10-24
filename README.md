@@ -68,11 +68,11 @@ Use these nodes with Openjutsu's exported API workflows or wire them into a comp
 
 ## Adding an object
 
-In Openjutsu, choose **Object swap → Add**, describe the object and its location, and draw a box covering its full silhouette and contact shadow. For example, use `a chocolate cake on a plate` and `on the table`. An optional reference picture controls the new object's appearance.
+In Openjutsu, choose **Object swap → Add**, describe the object and its location, and draw a box covering its full silhouette and contact shadow. For example, use `a chocolate cake on a plate` and `on the table`. An optional reference picture controls the new object's appearance. For something that moves or changes, such as a person, say what it does in `action` (`she dances the same routine in sync with the others`); empty means a still object.
 
 One placement keyframe keeps the editable area fixed on screen. For a moving camera, scrub to later frames and draw additional boxes; their positions and sizes are interpolated. This is manual placement animation, not automatic tracking. Draw new positions around cuts as needed. The model generates motion, perspective, lighting and occlusion within that editable area; results still depend on the source clip and prompt.
 
-The node's `placement` string is a JSON array of `{ "frame": 0, "x": 0.4, "y": 0.3, "width": 0.2, "height": 0.25 }` keyframes. Frames are relative to the selected video section at 24 fps; coordinates are fractions of the output canvas. Use the same JSON on the Object Swap Plan so moving the box invalidates resumed clips. Connect the original clip as the video reference and the placement mask to the masked-edit path. Add mode does not need SAM tracking.
+The node's `placement` string is a JSON array of `{ "frame": 0, "x": 0.4, "y": 0.3, "width": 0.2, "height": 0.25 }` keyframes. Frames are relative to the selected video section at 24 fps; coordinates are fractions of the output canvas. Use the same JSON on the Object Swap Plan so moving the box invalidates resumed clips. Connect the placement mask to the masked-edit path and leave the reference video inputs disconnected: the original clip shows the spot empty, and H3 copies that back. Add mode does not need SAM tracking.
 
 ## Models
 
