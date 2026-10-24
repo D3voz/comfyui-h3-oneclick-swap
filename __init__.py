@@ -625,19 +625,25 @@ class H3ObjectSwapPlan:
         thing = "the " + (parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1])
         change_to = " ".join(change_to.split()).rstrip(".")
         action = " ".join(action.split()) if mode == "add" else ""
-        if action and action[-1] not in ".!?":
-            action += "."
+        if action:
+            action = action[0].upper() + action[1:] + ("" if action[-1] in ".!?" else ".")
         if mode == "add":
             change_to = ADD_VERB.sub("", change_to)
         picture = picture_1 is not None and mode != "remove"
         desc = " ".join(picture_1_text.split()) if picture else ""
         if desc and not desc.endswith("."):
             desc += "."
-        never = {"change": "Never mention %s." % thing, "remove": "Never mention %s." % thing,
-                 "background": "Say nothing about the location, background or setting.",
-                 "add": "Say nothing about what is or is not %s, and do not count the people or objects." % target}[mode]
+        if mode == "add":
+            # A shot list of the source frames counted "three figures", and no dancer was added beside them.
+            where = placement_words(placement)
+            never = ("These images are from before the edit. Describe every shot as the finished clip: everyone and everything in the images "
+                     "is still there, and %s %s, %s, is there as well, in addition to them. Call it %s, and when you count people or objects, "
+                     "count it too." % (change_to or "the new object", target, where, "<Subject 1>" if picture else change_to or "the new object"))
+        else:
+            never = {"change": "Never mention %s." % thing, "remove": "Never mention %s." % thing,
+                     "background": "Say nothing about the location, background or setting."}[mode]
         clips, out_w, out_h = plan_clips(source_frames, clip_seconds, overlap_frames, short_edge or RESOLUTIONS[resolution])
-        prompts = [build_add_prompt(target, change_to, picture, desc, length, overlap, placement_words(placement), action) if mode == "add" else
+        prompts = [build_add_prompt(target, change_to, picture, desc, length, overlap, where, action) if mode == "add" else
                    build_edit_prompt(mode, thing, len(parts) > 1, change_to, picture, desc, length, overlap, keep_outline) for length, overlap in clips]
         pictures = [picture_1] if picture else []
         run_name = "edit_" + run_hash(source_frames, pictures, [mode, thing, change_to, desc, clips, out_w, out_h, steps, seed, keep_outline] + ([placement, action] if mode == "add" else []))
