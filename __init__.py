@@ -617,6 +617,7 @@ class H3ObjectSwapPlan:
                 "short_edge": SHORT_EDGE,
                 "placement": ("STRING", {"default": "", "tooltip": "Add mode: the placement keyframes used by H3 Object Placement Mask. Included in the run name so moving the object starts a new run."}),
                 "action": ("STRING", {"multiline": True, "default": "", "tooltip": "Add mode, optional: what the new thing does or how it looks over the clip (she dances the same routine in sync with the others). Empty: a still object."}),
+                "paint": ("STRING", {"default": "", "tooltip": "Change mode: painted edit keyframes. Repainting starts a new run."}),
             },
         }
 
@@ -627,7 +628,7 @@ class H3ObjectSwapPlan:
     CATEGORY = "conditioning/minimax/context_loop"
     DESCRIPTION = "Splits a source video into overlapping H3 clips and writes the prompt for changing, removing or re-setting the tracked things."
 
-    def build(self, source_frames, mode, target, change_to, clip_seconds, overlap_frames, resolution, steps, seed, keep_outline=True, picture_1=None, picture_1_text="", short_edge=0, placement="", action=""):
+    def build(self, source_frames, mode, target, change_to, clip_seconds, overlap_frames, resolution, steps, seed, keep_outline=True, picture_1=None, picture_1_text="", short_edge=0, placement="", action="", paint=""):
         parts = [re.sub(r"^(?:the|a|an)\s+", "", " ".join(p.split()), flags=re.I) for p in target.split(",")]
         parts = [p for p in parts if p] or ["person"]
         thing = "the " + (parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1])
@@ -654,7 +655,7 @@ class H3ObjectSwapPlan:
         prompts = [build_add_prompt(target, change_to, picture, desc, length, overlap, where, action) if mode == "add" else
                    build_edit_prompt(mode, thing, len(parts) > 1, change_to, picture, desc, length, overlap, keep_outline) for length, overlap in clips]
         pictures = [picture_1] if picture else []
-        run_name = "edit_" + run_hash(source_frames, pictures, [mode, thing, change_to, desc, clips, out_w, out_h, steps, seed, keep_outline] + ([placement, action] if mode == "add" else []))
+        run_name = "edit_" + run_hash(source_frames, pictures, [mode, thing, change_to, desc, clips, out_w, out_h, steps, seed, keep_outline] + ([placement, action] if mode == "add" else [paint] if mode == "change" and paint else []))
         return (plan_json("edit", prompts, clips, overlap_frames, steps, seed), out_w, out_h, run_name, EDIT_SHOTS_PROMPT % never)
 
 
@@ -694,6 +695,89 @@ class H3ObjectPlacementMask:
             right, bottom = max(left + 1, math.ceil((x + width) * mw)), max(top + 1, math.ceil((y + height) * mh))
             mask[i, top:bottom, left:right] = 1.0
         return (mask,)
+
+
+class H3PaintedEditArea:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"tracked": ("MASK",), "paint": ("STRING", {"multiline": True}),
+                             "start_frame": ("INT", {"default": 0, "min": 0, "max": 0x7fffffff}),
+                             "width": ("INT", {"default": 576, "min": 1}), "height": ("INT", {"default": 1024, "min": 1})}}
+
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "build"
+    CATEGORY = "conditioning/minimax/context_loop"
+    DESCRIPTION = "Painted edit keyframes follow the tracked bounding box, without rotation. Empty tracks have no paint."
+
+    def build(self, tracked, paint, start_frame, width, height):
+        # Match Source Slice's centre crop, keeping SAM's scale so Grow Mask still uses SAM pixels.
+        n, h, w = tracked.shape
+        scale = max(h, w) / max(width, height)
+        h, w = max(1, round(height * scale)), max(1, round(width * scale))
+        tracked = comfy.utils.common_upscale(tracked[:, None], w, h, "bilinear", "center")[:, 0]
+        occupied = (tracked > 0.5).cpu().numpy()
+        boxes = []
+        for mask in occupied:
+            ys, xs = np.nonzero(mask)
+            boxes.append((int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1) if len(xs) else None)
+        points = json.loads(paint)
+        anchors = []
+        for p in sorted(points, key=lambda p: p["frame"]):
+            frame = p["frame"] - start_frame
+            if frame < 0 or frame >= n:
+                raise ValueError("Paint keyframes must be inside the tracked timeline.")
+            box = boxes[frame]
+            if box is None:
+                continue
+            pw, ph = p["width"], p["height"]
+            if not (isinstance(pw, int) and isinstance(ph, int) and 1 <= pw <= 256 and 1 <= ph <= 256):
+                raise ValueError("Paint masks must be at most 256 pixels per side.")
+            pixels = np.zeros(pw * ph, dtype=np.float32)
+            runs = p["runs"]
+            if len(runs) % 2:
+                raise ValueError("Paint runs need start and length pairs.")
+            end = 0
+            for a, count in zip(runs[::2], runs[1::2]):
+                if not (isinstance(a, int) and isinstance(count, int) and a >= end and count > 0 and a + count <= pw * ph):
+                    raise ValueError("Paint runs must be ordered and inside the mask.")
+                pixels[a:a + count] = 1
+                end = a + count
+            pixels = pixels.reshape(ph, pw)
+            ys, xs = np.nonzero(pixels)
+            if not len(xs):
+                continue
+            x0, y0, x1, y1 = int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+            bx, by, br, bb = box
+            relative = ((x0 * w / pw - bx) / (br - bx), (y0 * h / ph - by) / (bb - by),
+                        (x1 * w / pw - bx) / (br - bx), (y1 * h / ph - by) / (bb - by))
+            shape = torch.from_numpy(pixels[y0:y1, x0:x1].copy()).to(device=tracked.device, dtype=tracked.dtype)[None, None]
+            shape = F.interpolate(shape, size=(128, 128), mode="bilinear", align_corners=False)
+            anchors.append((frame, relative, shape))
+        result = tracked.clone()
+        if not anchors:
+            return (result,)
+        j = 0
+        for i, box in enumerate(boxes):
+            if box is None:
+                continue
+            while j + 1 < len(anchors) and anchors[j + 1][0] <= i:
+                j += 1
+            a, b = anchors[j], anchors[min(j + 1, len(anchors) - 1)]
+            t = max(0.0, min(1.0, (i - a[0]) / (b[0] - a[0]))) if a[0] != b[0] else 0.0
+            left, top, right, bottom = [x + (y - x) * t for x, y in zip(a[1], b[1])]
+            bx, by, br, bb = box
+            left, right = bx + left * (br - bx), bx + right * (br - bx)
+            top, bottom = by + top * (bb - by), by + bottom * (bb - by)
+            x0, y0, x1, y1 = max(0, math.floor(left)), max(0, math.floor(top)), min(w, math.ceil(right)), min(h, math.ceil(bottom))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            x = (torch.arange(x0, x1, device=tracked.device, dtype=tracked.dtype) + 0.5 - left) * (2 / (right - left)) - 1
+            y = (torch.arange(y0, y1, device=tracked.device, dtype=tracked.dtype) + 0.5 - top) * (2 / (bottom - top)) - 1
+            yy, xx = torch.meshgrid(y, x, indexing="ij")
+            shape = torch.lerp(a[2], b[2], t)
+            area = F.grid_sample(shape, torch.stack((xx, yy), -1)[None], mode="bilinear", padding_mode="zeros", align_corners=False)[0, 0]
+            result[i, y0:y1, x0:x1] = torch.maximum(result[i, y0:y1, x0:x1], area)
+        return (result,)
 
 
 FACE_OVERLAP = 24
@@ -1564,7 +1648,7 @@ NODE_CLASS_MAPPINGS = {"H3OneClickSwapPlan": H3OneClickSwapPlan, "H3AdvancedSwap
                        "H3TrackCrops": H3TrackCrops, "H3TrackRoles": H3TrackRoles, "H3RoleMask": H3RoleMask, "H3SubjectPrompt": H3SubjectPrompt,
                        "H3MontagePeople": H3MontagePeople, "H3MontagePlan": H3MontagePlan, "H3MontagePass": H3MontagePass,
                        "H3MontageTracks": H3MontageTracks, "H3MontagePicks": H3MontagePicks, "H3ObjectSwapPlan": H3ObjectSwapPlan,
-                       "H3ObjectPlacementMask": H3ObjectPlacementMask, "H3FaceChunks": H3FaceChunks, "H3FaceJoin": H3FaceJoin}
+                       "H3ObjectPlacementMask": H3ObjectPlacementMask, "H3PaintedEditArea": H3PaintedEditArea, "H3FaceChunks": H3FaceChunks, "H3FaceJoin": H3FaceJoin}
 NODE_DISPLAY_NAME_MAPPINGS = {"H3OneClickSwapPlan": "H3 One-Click Swap Plan", "H3AdvancedSwapPlan": "H3 Advanced Swap Plan (labelled roles)",
                               "H3PictureSwapPlan": "H3 Picture Swap Plan (person + setting from the picture)",
                               "H3GreyMannequins": "H3 Grey Mannequins (hide people)", "H3PeopleMask": "H3 People Mask (headroom per person)",
@@ -1575,4 +1659,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {"H3OneClickSwapPlan": "H3 One-Click Swap Plan", "H
                               "H3MontagePass": "H3 Montage Pass (this clip's person)", "H3MontageTracks": "H3 Montage Tracks (from Find people)", "H3MontagePicks": "H3 Montage Picks (no review)",
                               "H3ObjectSwapPlan": "H3 Object Swap Plan (change, remove, background, add)",
                               "H3ObjectPlacementMask": "H3 Object Placement Mask (keyframed box)",
+                              "H3PaintedEditArea": "H3 Painted Edit Area (follows tracked mask)",
                               "H3FaceChunks": "H3 Face Fix Chunks", "H3FaceJoin": "H3 Face Fix Join"}
