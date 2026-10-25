@@ -15,7 +15,12 @@ from PIL import Image
 import comfy.model_management
 import comfy.utils
 import folder_paths
-from comfy.ldm.sam3.tracker import unpack_masks
+
+try:
+    from comfy.ldm.sam3.tracker import unpack_masks
+except ImportError:  # ComfyUI before v0.20.0 has no SAM 3; keep the nodes that do not read SAM 3 tracks loadable.
+    def unpack_masks(packed):
+        raise RuntimeError("This node reads SAM 3 tracks and needs ComfyUI v0.20.0 or newer. Update ComfyUI.")
 
 FPS = 24
 CUT_SNAP = 4
@@ -888,6 +893,10 @@ class H3GreyMannequins:
         return (out,)
 
 
+# Set bits per byte, to measure a packed SAM 3 track without unpacking it.
+BIT_COUNTS = torch.tensor([bin(i).count("1") for i in range(256)], dtype=torch.uint8)
+
+
 def person_mask(m, headroom, hold_frames):
     """One person's [frames, h, w] mask with hold and headroom, and per pixel their height as a share of the frame."""
     n, mh = m.shape[:2]
@@ -935,24 +944,37 @@ class H3PeopleMask:
         if packed is None:
             empty = torch.zeros(track_data["n_frames"], h, w, device=comfy.model_management.intermediate_device())
             return (empty, empty)
-        areas = [int(unpack_masks(packed[:, i]).sum()) for i in range(packed.shape[1])]
+        n = packed.shape[0]
+        bit_counts = BIT_COUNTS.to(packed.device)
+        areas = [int(bit_counts[packed[:, i].int()].sum()) for i in range(packed.shape[1])]
         order = [i for i in sorted(range(len(areas)), key=lambda i: -areas[i]) if areas[i]]
         union = size = None
         for i in order[:max_people or None]:
-            person, person_size = person_mask(unpack_masks(packed[:, i]).float(), headroom, hold_frames)
-            union = person if union is None else union | person
-            size = person_size if size is None else torch.maximum(size, person_size)
+            # Only the frames this person is in, plus the hold either side: a whole-video float copy per person ran to GBs.
+            on = packed[:, i].flatten(1).any(1).nonzero().flatten().tolist()
+            a, b = max(0, on[0] - hold_frames), min(n, on[-1] + 1 + hold_frames)
+            person, person_size = person_mask(unpack_masks(packed[a:b, i]).float(), headroom, hold_frames)
+            if union is None:
+                union = torch.zeros(n, *person.shape[1:], dtype=torch.bool, device=person.device)
+                size = torch.zeros(n, *person.shape[1:], device=person.device)
+            union[a:b] |= person
+            size[a:b] = torch.maximum(size[a:b], person_size)
         if union is None:
             empty = torch.zeros(packed.shape[0], h, w, device=comfy.model_management.intermediate_device())
             return (empty, empty)
-        mask = F.interpolate(union.float()[:, None], size=(h, w), mode="bilinear")[:, 0]
-        size = F.interpolate(size[:, None], size=(h, w), mode="nearest")[:, 0]
+        if union.shape[1:] == (h, w):  # resizing to the same size only makes another whole-video copy
+            mask = union.float()
+        else:
+            mask = F.interpolate(union.float()[:, None], size=(h, w), mode="bilinear")[:, 0]
+            size = F.interpolate(size[:, None], size=(h, w), mode="nearest")[:, 0]
         return (mask, size)
 
 
 def find_shots(images, cut_threshold):
     """(start, end) frame ranges of the shots between hard cuts."""
-    grey = F.interpolate(images[..., :3].mean(-1, keepdim=True).movedim(-1, 1).float(), size=(90, 160), mode="area")[:, 0] * 255
+    # In batches: a full-resolution float copy of every frame at once is GBs for a long video.
+    grey = torch.cat([F.interpolate(images[i:i + 64, ..., :3].mean(-1, keepdim=True).movedim(-1, 1).float(), size=(90, 160), mode="area")[:, 0]
+                      for i in range(0, images.shape[0], 64)]) * 255
     diffs = [0.0] + (grey[1:] - grey[:-1]).abs().mean(dim=(1, 2)).tolist()
     starts = [0]
     for i in range(1, len(diffs)):
@@ -1321,24 +1343,24 @@ class H3RoleMask:
             n = track_data["n_frames"]
             empty = torch.zeros(n, h, w, device=comfy.model_management.intermediate_device())
             return (empty, empty, torch.zeros(n, h, w, dtype=torch.uint8))
+        n = packed.shape[0]
         union = size = role_map = None
         for s in labels:
+            # Only the label's own frames: the hold stays inside the shot, and a whole-video float copy per label ran to GBs.
             a, b = s["start"], s["end"]
-            m = unpack_masks(packed[:, s["track"]]).float()
-            m[:a] = 0
-            m[b:] = 0
-            person, person_size = person_mask(m, headroom, hold_frames)
-            person[:a] = False
-            person[b:] = False
-            person_size = person_size * person
+            person, person_size = person_mask(unpack_masks(packed[a:b, s["track"]]).float(), headroom, hold_frames)
             if union is None:
-                union, size, role_map = person, person_size, person.to(torch.uint8) * s["role"]
-            else:
-                union = union | person
-                size = torch.maximum(size, person_size)
-                role_map = torch.where(person, s["role"], role_map).to(torch.uint8)
-        mask = F.interpolate(union.float()[:, None], size=(h, w), mode="bilinear")[:, 0]
-        size = F.interpolate(size[:, None], size=(h, w), mode="nearest")[:, 0]
+                union = torch.zeros(n, *person.shape[1:], dtype=torch.bool, device=person.device)
+                size = torch.zeros(n, *person.shape[1:], device=person.device)
+                role_map = torch.zeros(n, *person.shape[1:], dtype=torch.uint8, device=person.device)
+            union[a:b] |= person
+            size[a:b] = torch.maximum(size[a:b], person_size)
+            role_map[a:b] = torch.where(person, s["role"], role_map[a:b])
+        if union.shape[1:] == (h, w):  # resizing to the same size only makes another whole-video copy
+            mask = union.float()
+        else:
+            mask = F.interpolate(union.float()[:, None], size=(h, w), mode="bilinear")[:, 0]
+            size = F.interpolate(size[:, None], size=(h, w), mode="nearest")[:, 0]
         return (mask, size, role_map)
 
 
