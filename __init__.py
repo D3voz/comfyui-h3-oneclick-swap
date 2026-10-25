@@ -689,30 +689,141 @@ class H3ObjectPlacementMask:
     DESCRIPTION = "An editable box per video frame, interpolated between normalized placement keyframes. One keyframe keeps the box fixed on screen."
 
     def build(self, images, placement, start_frame=0):
-        points = sorted(json.loads(placement), key=lambda p: p["frame"])
-        if not points:
-            raise ValueError("Draw an object placement area first.")
-        for p in points:
-            if not isinstance(p["frame"], int) or any(not isinstance(p[k], (int, float)) or not math.isfinite(p[k]) for k in ("x", "y", "width", "height")):
-                raise ValueError("Placement keyframes need a frame number and finite normalized box coordinates.")
-            if not (0 <= p["x"] < 1 and 0 <= p["y"] < 1 and 0 < p["width"] <= 1 - p["x"] + 1e-6 and 0 < p["height"] <= 1 - p["y"] + 1e-6):
-                raise ValueError("The placement area must be inside the video frame.")
         n, h, w = images.shape[:3]
         scale = min(1.0, 256 / max(h, w))
         mh, mw = max(1, round(h * scale)), max(1, round(w * scale))
         mask = torch.zeros(n, mh, mw, device=comfy.model_management.intermediate_device())
-        j = 0
-        for i in range(n):
-            frame = start_frame + i
-            while j + 1 < len(points) and points[j + 1]["frame"] <= frame:
-                j += 1
-            a, b = points[j], points[min(j + 1, len(points) - 1)]
-            t = max(0.0, min(1.0, (frame - a["frame"]) / (b["frame"] - a["frame"]))) if b["frame"] != a["frame"] else 0.0
-            x, y, width, height = [a[k] + (b[k] - a[k]) * t for k in ("x", "y", "width", "height")]
-            left, top = int(x * mw), int(y * mh)
-            right, bottom = max(left + 1, math.ceil((x + width) * mw)), max(top + 1, math.ceil((y + height) * mh))
+        for i, box in enumerate(placement_boxes(placement, start_frame, n)):
+            top, bottom, left, right = box_pixels(box, mh, mw)
             mask[i, top:bottom, left:right] = 1.0
         return (mask,)
+
+
+def placement_boxes(placement, start_frame, n):
+    """Normalized (x, y, width, height) of the placement box on each of n frames, interpolated between keyframes."""
+    points = sorted(json.loads(placement), key=lambda p: p["frame"])
+    if not points:
+        raise ValueError("Draw an object placement area first.")
+    for p in points:
+        if not isinstance(p["frame"], int) or any(not isinstance(p[k], (int, float)) or not math.isfinite(p[k]) for k in ("x", "y", "width", "height")):
+            raise ValueError("Placement keyframes need a frame number and finite normalized box coordinates.")
+        if not (0 <= p["x"] < 1 and 0 <= p["y"] < 1 and 0 < p["width"] <= 1 - p["x"] + 1e-6 and 0 < p["height"] <= 1 - p["y"] + 1e-6):
+            raise ValueError("The placement area must be inside the video frame.")
+    boxes, j = [], 0
+    for i in range(n):
+        frame = start_frame + i
+        while j + 1 < len(points) and points[j + 1]["frame"] <= frame:
+            j += 1
+        a, b = points[j], points[min(j + 1, len(points) - 1)]
+        t = max(0.0, min(1.0, (frame - a["frame"]) / (b["frame"] - a["frame"]))) if b["frame"] != a["frame"] else 0.0
+        boxes.append(tuple(a[k] + (b[k] - a[k]) * t for k in ("x", "y", "width", "height")))
+    return boxes
+
+
+def box_pixels(box, h, w):
+    """(top, bottom, left, right) of a normalized box on an h x w grid, at least one cell each way."""
+    x, y, width, height = box
+    left, top = int(x * w + 1e-6), int(y * h + 1e-6)
+    return top, max(top + 1, math.ceil((y + height) * h - 1e-6)), left, max(left + 1, math.ceil((x + width) * w - 1e-6))
+
+
+class H3AddFitCheck:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"images": ("IMAGE", {"tooltip": "The frames SAM tracked the people in."}), "track_data": ("SAM3_TRACK_DATA",),
+                             "placement": ("STRING", {"multiline": True}), "start_frame": ("INT", {"default": 0, "min": 0, "max": 0x7fffffff})}}
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("preview",)
+    OUTPUT_NODE = True
+    FUNCTION = "check"
+    CATEGORY = "conditioning/minimax/context_loop"
+    DESCRIPTION = ("Before adding someone who copies a person's routine: moves the person nearest the placement box into it, scaled to the box "
+                   "height and standing on its bottom edge, and shows where their movement leaves the box (green inside, red outside).")
+
+    def check(self, images, track_data, placement, start_frame=0):
+        n, h, w = images.shape[:3]
+        boxes = placement_boxes(placement, start_frame, n)
+        packed = track_data["packed_masks"]
+        summary = {"frames": n, "person": False, "outside": [], "needed": None}
+        preview = images[..., :3] * 0.75
+        person = None
+        if packed is not None:
+            th, tw = packed.shape[2], packed.shape[3] * 8
+            columns = torch.arange(tw, device=packed.device, dtype=torch.float32)
+            best = None
+            for i in range(packed.shape[1]):
+                m = unpack_masks(packed[:, i])
+                area = m.sum((1, 2)).float()
+                on = (area > 0).tolist()
+                if sum(on) < n / 4:
+                    continue
+                centers = ((m.sum(1) * columns).sum(1) / area.clamp(min=1) / tw).tolist()
+                gap = sum(abs(c - (b[0] + b[2] / 2)) for c, b, o in zip(centers, boxes, on) if o) / sum(on)
+                if best is None or gap < best[0]:
+                    best = (gap, m, centers, on)
+            if best is not None:
+                _, person, centers, on = best
+        if person is not None:
+            row_counts, column_counts = person.sum(2), person.sum(1)
+            rows = row_counts > 0
+            tops = torch.where(rows, torch.arange(th, device=rows.device), th).amin(1).tolist()
+            bottoms = torch.where(rows, torch.arange(th, device=rows.device), -1).amax(1).tolist()
+            floor = max(bottoms)
+            tall = floor - min(t for t, o in zip(tops, on) if o) + 1
+            center = sum(c for c, o in zip(centers, on) if o) / sum(on) * tw
+            row_positions = torch.arange(th, device=person.device, dtype=torch.float32)
+            ys, xs = torch.meshgrid(row_positions, columns, indexing="ij")
+            pixel_boxes = [box_pixels(box, th, tw) for box in boxes]
+            flagged = []
+            big = lambda m: F.interpolate(m[None, None].float(), size=(h, w), mode="nearest")[0, 0].to(preview.device) > 0.5
+            for f, (top, bottom, left, right) in enumerate(pixel_boxes):
+                if not on[f]:
+                    flagged.append(None)
+                    continue
+                # Fit the routine's full vertical range, including jumps, with its lowest point on the box's bottom edge.
+                s = (bottom - top) / tall
+                gx = ((xs + 0.5 - (left + right) / 2) / s + center + 0.5) / tw * 2 - 1
+                gy = ((ys + 0.5 - bottom) / s + floor + 1) / th * 2 - 1
+                ghost = F.grid_sample(person[f][None, None].float(), torch.stack((gx, gy), -1)[None], align_corners=False)[0, 0] > 0.5
+                inside = torch.zeros_like(ghost)
+                inside[top:bottom, left:right] = True
+                out = ghost & ~inside
+                # Count the complete pose in source space, including parts beyond the video frame.
+                px = (columns - center) * s + (left + right) / 2
+                py = (row_positions - floor - 0.5) * s + bottom
+                sides = (("left", (left - px) / s + 0.5, column_counts[f]), ("right", (px - right) / s + 0.5, column_counts[f]),
+                         ("top", (top - py) / s + 0.5, row_counts[f]), ("bottom", (py - bottom) / s + 0.5, row_counts[f]))
+                area = int(row_counts[f].sum())
+                flagged.append([side for side, fraction, counts in sides if float((fraction.clamp(0, 1) * counts).sum()) > 0.02 * area])
+                green, red = big(ghost & inside), big(out)
+                preview[f][green] = preview[f][green] * 0.5 + torch.tensor([0.1, 0.8, 0.2], device=preview.device) * 0.5
+                preview[f][red] = preview[f][red] * 0.4 + torch.tensor([1.0, 0.1, 0.1], device=preview.device) * 0.6
+            summary["person"] = True
+            for f, sides in enumerate(flagged):
+                if sides:
+                    if summary["outside"] and f - summary["outside"][-1]["end"] <= 2:  # bridge a frame or two that just fit
+                        summary["outside"][-1]["end"] = f + 1
+                        summary["outside"][-1]["sides"] = sorted(set(summary["outside"][-1]["sides"]) | set(sides))
+                    else:
+                        summary["outside"].append({"start": f, "end": f + 1, "sides": sides})
+            occupied_cols = column_counts.any(0).nonzero().flatten().tolist()
+            radius = max(center - occupied_cols[0] + 0.5, occupied_cols[-1] + 0.5 - center)
+            # Keep equal room either side of the anchor; an asymmetric tight box would move the pose again.
+            height = min(max(bottom - top for top, bottom, left, right in pixel_boxes), math.floor((tw - 2) * tall / (2 * radius)))
+            width = math.ceil(2 * radius * height / tall) + 2
+            if height > 0 and width <= tw:
+                top, bottom, left, right = pixel_boxes[0]
+                left = max(0, min(tw - width, round((left + right - width) / 2)))
+                top = max(0, min(th - height, bottom - height))
+                summary["needed"] = {"x": left / tw, "y": top / th, "width": width / tw, "height": height / th}
+        for f, box in enumerate(boxes):
+            top, bottom, left, right = box_pixels(box, h, w)
+            edge = max(1, round(h / 200))
+            for part in (preview[f, top:top + edge, left:right], preview[f, max(top, bottom - edge):bottom, left:right],
+                         preview[f, top:bottom, left:left + edge], preview[f, top:bottom, max(left, right - edge):right]):
+                part[:] = torch.tensor([1.0, 0.85, 0.1], device=preview.device)
+        return {"ui": {"files": [save_temp_json("h3_add_fit", summary)]}, "result": (preview,)}
 
 
 class H3PaintedEditArea:
@@ -1666,7 +1777,7 @@ NODE_CLASS_MAPPINGS = {"H3OneClickSwapPlan": H3OneClickSwapPlan, "H3AdvancedSwap
                        "H3TrackCrops": H3TrackCrops, "H3TrackRoles": H3TrackRoles, "H3RoleMask": H3RoleMask, "H3SubjectPrompt": H3SubjectPrompt,
                        "H3MontagePeople": H3MontagePeople, "H3MontagePlan": H3MontagePlan, "H3MontagePass": H3MontagePass,
                        "H3MontageTracks": H3MontageTracks, "H3MontagePicks": H3MontagePicks, "H3ObjectSwapPlan": H3ObjectSwapPlan, "H3SoundtrackOrSilence": H3SoundtrackOrSilence,
-                       "H3ObjectPlacementMask": H3ObjectPlacementMask, "H3PaintedEditArea": H3PaintedEditArea, "H3FaceChunks": H3FaceChunks, "H3FaceJoin": H3FaceJoin}
+                       "H3ObjectPlacementMask": H3ObjectPlacementMask, "H3AddFitCheck": H3AddFitCheck, "H3PaintedEditArea": H3PaintedEditArea, "H3FaceChunks": H3FaceChunks, "H3FaceJoin": H3FaceJoin}
 NODE_DISPLAY_NAME_MAPPINGS = {"H3OneClickSwapPlan": "H3 One-Click Swap Plan", "H3AdvancedSwapPlan": "H3 Advanced Swap Plan (labelled roles)",
                               "H3PictureSwapPlan": "H3 Picture Swap Plan (person + setting from the picture)",
                               "H3GreyMannequins": "H3 Grey Mannequins (hide people)", "H3PeopleMask": "H3 People Mask (headroom per person)",
@@ -1676,6 +1787,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {"H3OneClickSwapPlan": "H3 One-Click Swap Plan", "H
                               "H3MontagePeople": "H3 Montage People (save for the person list)", "H3MontagePlan": "H3 Montage Plan (labels, seed, size)",
                               "H3MontagePass": "H3 Montage Pass (this clip's person)", "H3MontageTracks": "H3 Montage Tracks (from Find people)", "H3MontagePicks": "H3 Montage Picks (no review)",
                               "H3ObjectSwapPlan": "H3 Object Swap Plan (change, remove, background, add)", "H3SoundtrackOrSilence": "H3 Soundtrack (silence if none)",
-                              "H3ObjectPlacementMask": "H3 Object Placement Mask (keyframed box)",
+                              "H3ObjectPlacementMask": "H3 Object Placement Mask (keyframed box)", "H3AddFitCheck": "H3 Add Fit Check (does their routine fit the box)",
                               "H3PaintedEditArea": "H3 Painted Edit Area (follows tracked mask)",
                               "H3FaceChunks": "H3 Face Fix Chunks", "H3FaceJoin": "H3 Face Fix Join"}

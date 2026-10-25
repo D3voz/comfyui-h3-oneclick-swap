@@ -10,9 +10,10 @@ import torch
 import torch.nn.functional as F
 
 
-# Load only this node so the tensor tests do not initialize ComfyUI's GPU runtime.
+# Load only the area nodes so the tensor tests do not initialize ComfyUI's GPU runtime.
 source = ast.parse(Path(__file__).with_name("__init__.py").read_text(encoding="utf-8"))
-node = next(item for item in source.body if isinstance(item, ast.ClassDef) and item.name == "H3PaintedEditArea")
+names = {"H3PaintedEditArea", "H3AddFitCheck", "placement_boxes", "box_pixels"}
+nodes = [item for item in source.body if isinstance(item, (ast.ClassDef, ast.FunctionDef)) and item.name in names]
 
 
 def center_crop(images, width, height, method, crop):
@@ -29,9 +30,12 @@ def center_crop(images, width, height, method, crop):
 
 
 namespace = dict(torch=torch, np=np, json=json, math=math, F=F,
-                 comfy=SimpleNamespace(utils=SimpleNamespace(common_upscale=center_crop)))
-exec(compile(ast.Module(body=[node], type_ignores=[]), "<painted-area>", "exec"), namespace)
+                 comfy=SimpleNamespace(utils=SimpleNamespace(common_upscale=center_crop)),
+                 unpack_masks=lambda packed: torch.from_numpy(np.unpackbits(packed.numpy(), axis=-1, bitorder="little")).bool(),
+                 save_temp_json=lambda prefix, data: data)
+exec(compile(ast.Module(body=nodes, type_ignores=[]), "<edit-area>", "exec"), namespace)
 PaintedArea = namespace["H3PaintedEditArea"]
+FitCheck = namespace["H3AddFitCheck"]
 
 
 def rectangle(frame, x, y, width, height):
@@ -87,6 +91,68 @@ class PaintedAreaTests(unittest.TestCase):
             paint = json.dumps([dict(frame=0, width=100, height=100, runs=runs)])
             with self.assertRaises(ValueError):
                 PaintedArea().build(tracked, paint, 0, 100, 100)
+
+
+class FitCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.masks = torch.zeros(8, 1, 100, 104, dtype=torch.bool)
+        self.masks[:, 0, 20:80, 60:70] = True
+        self.masks[4:, 0, 40:50, 65:100] = True
+        self.box = dict(x=0.3, y=0.1, width=0.18, height=0.8)
+
+    def check(self, box):
+        packed = torch.from_numpy(np.packbits(self.masks.numpy(), axis=-1, bitorder="little"))
+        placement = box if isinstance(box, list) else [dict(frame=0, **box)]
+        result = FitCheck().check(torch.zeros(8, 100, 104, 3), {"packed_masks": packed}, json.dumps(placement))
+        return result["ui"]["files"][0]
+
+    def test_suggested_box_fits_an_asymmetric_routine(self):
+        summary = self.check(self.box)
+        self.assertTrue(summary["outside"])
+        self.assertIsNotNone(summary["needed"])
+        self.assertEqual(self.check(summary["needed"])["outside"], [])
+
+    def test_normalized_pixel_boxes_keep_their_original_dimensions(self):
+        self.assertEqual(namespace["box_pixels"]((5 / 104, 57 / 100, 99 / 104, 15 / 100), 100, 104), (57, 72, 5, 104))
+
+    def test_overflow_beyond_the_video_frame_is_counted(self):
+        self.masks[:] = False
+        self.masks[:, 0, 20:80, 60:70] = True
+        self.masks[:, 0, 40:42, 10:65] = True
+        summary = self.check(dict(x=0, y=0.1, width=0.3, height=0.8))
+        self.assertEqual(summary["outside"], [dict(start=0, end=8, sides=["left"])])
+
+    def test_suggested_boxes_fit_near_both_frame_edges(self):
+        for mirrored in (False, True):
+            for x in (0, 0.7):
+                with self.subTest(mirrored=mirrored, x=x):
+                    summary = self.check(dict(x=x, y=0.1, width=0.3, height=0.8))
+                    box = summary["needed"]
+                    self.assertIsNotNone(box)
+                    self.assertGreaterEqual(box["x"], 0)
+                    self.assertLessEqual(box["x"] + box["width"], 1)
+                    self.assertEqual(self.check(box)["outside"], [])
+            self.masks = self.masks.flip(-1)
+
+    def test_wide_routine_gets_a_shorter_box_that_fits(self):
+        self.masks[:] = False
+        self.masks[:, 0, 40:60, 5:100] = True
+        summary = self.check(self.box)
+        self.assertTrue(summary["outside"])
+        self.assertLess(summary["needed"]["height"], self.box["height"])
+        self.assertEqual(self.check(summary["needed"])["outside"], [])
+
+    def test_moving_boxes_get_one_fixed_box_that_fits(self):
+        summary = self.check([dict(frame=0, **self.box), dict(frame=7, x=0.7, y=0.3, width=0.2, height=0.6)])
+        self.assertEqual(self.check(summary["needed"])["outside"], [])
+
+    def test_vertical_motion_fits_the_box_height(self):
+        self.masks[4:] = False
+        self.masks[4:, 0, 0:60, 60:70] = True
+        summary = self.check(self.box)
+        self.assertEqual(summary["outside"], [])
+        self.assertIsNotNone(summary["needed"])
+        self.assertEqual(self.check(summary["needed"])["outside"], [])
 
 
 if __name__ == "__main__":
