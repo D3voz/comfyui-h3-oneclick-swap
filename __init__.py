@@ -369,6 +369,9 @@ class H3MontagePlan:
 
         # the frames each appearance is really on screen; a label also spans the gaps around it
         packed = track_data["packed_masks"]
+        tracked = 0 if packed is None else packed.shape[1]
+        if any(not 0 <= l["track"] < tracked for l in labels):
+            raise ValueError("The montage labels name a person Find people did not track. Find people again with the same video, part and size.")
         shown = []
         who = [set() for _ in range(source_frames.shape[0])]
         for l in labels:
@@ -808,17 +811,18 @@ class H3FaceJoin:
         plan, crops, transform = plan[0], crops[0], transform[0]
         starts, length, total = plan["starts"], plan["length"], plan["total"]
         acc = torch.zeros_like(crops)
-        wsum = torch.zeros(total, 1, 1, 1)
+        dev = crops.device
+        wsum = torch.zeros(total, 1, 1, 1, device=dev)
         for k, (s, image) in enumerate(zip(starts, images)):
             n = min(length, total - s)
             # linear ramps across each overlap, falling to 0 at a chunk's end where its neighbour takes over
-            w = torch.ones(n)
+            w = torch.ones(n, device=dev)
             if k and starts[k - 1] + length > s:
                 o = starts[k - 1] + length - s
-                w[:o] = torch.arange(1, o + 1) / (o + 1)
+                w[:o] = torch.arange(1, o + 1, device=dev) / (o + 1)
             if k + 1 < len(starts) and s + length > starts[k + 1]:
                 o = s + length - starts[k + 1]
-                w[n - o:] = torch.minimum(w[n - o:], torch.arange(o, 0, -1) / (o + 1))
+                w[n - o:] = torch.minimum(w[n - o:], torch.arange(o, 0, -1, device=dev) / (o + 1))
             acc[s:s + n] += image[:n].to(acc) * w[:, None, None, None]
             wsum[s:s + n, 0, 0, 0] += w
         covered = wsum[:, 0, 0, 0] > 0
