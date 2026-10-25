@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 # Load only the area nodes so the tensor tests do not initialize ComfyUI's GPU runtime.
 source = ast.parse(Path(__file__).with_name("__init__.py").read_text(encoding="utf-8"))
-names = {"H3PaintedEditArea", "H3AddFitCheck", "placement_boxes", "box_pixels"}
+names = {"H3PaintedEditArea", "H3AddFitCheck", "H3ObjectPlacementMask", "H3AddMovingArea", "placement_boxes", "box_pixels", "placement_person", "placement_pose"}
 nodes = [item for item in source.body if isinstance(item, (ast.ClassDef, ast.FunctionDef)) and item.name in names]
 
 
@@ -30,12 +30,13 @@ def center_crop(images, width, height, method, crop):
 
 
 namespace = dict(torch=torch, np=np, json=json, math=math, F=F,
-                 comfy=SimpleNamespace(utils=SimpleNamespace(common_upscale=center_crop)),
+                 comfy=SimpleNamespace(utils=SimpleNamespace(common_upscale=center_crop), model_management=SimpleNamespace(intermediate_device=lambda: torch.device("cpu"))),
                  unpack_masks=lambda packed: torch.from_numpy(np.unpackbits(packed.numpy(), axis=-1, bitorder="little")).bool(),
                  save_temp_json=lambda prefix, data: data)
 exec(compile(ast.Module(body=nodes, type_ignores=[]), "<edit-area>", "exec"), namespace)
 PaintedArea = namespace["H3PaintedEditArea"]
 FitCheck = namespace["H3AddFitCheck"]
+MovingArea = namespace["H3AddMovingArea"]
 
 
 def rectangle(frame, x, y, width, height):
@@ -153,6 +154,45 @@ class FitCheckTests(unittest.TestCase):
         self.assertEqual(summary["outside"], [])
         self.assertIsNotNone(summary["needed"])
         self.assertEqual(self.check(summary["needed"])["outside"], [])
+
+    def test_moving_area_contains_the_pose_when_arms_leave_the_box(self):
+        images = torch.zeros(8, 100, 104, 3)
+        packed = torch.from_numpy(np.packbits(self.masks.numpy(), axis=-1, bitorder="little"))
+        placement = json.dumps([dict(frame=0, **self.box)])
+        mask = MovingArea().build(images, placement, {"packed_masks": packed})[0]
+        boxes = namespace["placement_boxes"](placement, 0, 8)
+        person, center, floor, tall = namespace["placement_person"]({"packed_masks": packed}, boxes)
+        grid = torch.meshgrid(torch.arange(100, dtype=torch.float32), torch.arange(104, dtype=torch.float32), indexing="ij")
+        for f, box in enumerate(boxes):
+            ghost = namespace["placement_pose"](person[f], namespace["box_pixels"](box, 100, 104), center, floor, tall, grid)
+            self.assertTrue(torch.all(mask[f][ghost] == 1))
+        self.assertGreater(float(mask[4].sum()), float(mask[0].sum()))
+        self.assertTrue(torch.any(mask[4, :, 51:] > 0))
+
+    def test_moving_area_keeps_fixed_boxes_without_a_person_or_during_track_gaps(self):
+        images = torch.zeros(8, 100, 104, 3)
+        placement = json.dumps([dict(frame=0, **self.box)])
+        fixed = namespace["H3ObjectPlacementMask"]().build(images, placement)[0]
+        self.assertTrue(torch.equal(MovingArea().build(images, placement, {"packed_masks": None})[0], fixed))
+        self.masks[3] = False
+        packed = torch.from_numpy(np.packbits(self.masks.numpy(), axis=-1, bitorder="little"))
+        mask = MovingArea().build(images, placement, {"packed_masks": packed})[0]
+        self.assertTrue(torch.equal(mask[3], fixed[3]))
+
+    def test_moving_preview_shows_the_generation_boundary(self):
+        images = torch.zeros(8, 100, 104, 3)
+        packed = torch.from_numpy(np.packbits(self.masks.numpy(), axis=-1, bitorder="little"))
+        tracks = {"packed_masks": packed}
+        placement = json.dumps([dict(frame=0, **self.box)])
+        mask = MovingArea().build(images, placement, tracks)[0]
+        result = FitCheck().check(images, tracks, placement, moving_area=True)
+        summary = result["ui"]["files"][0]
+        self.assertTrue(summary["moving"])
+        self.assertEqual(summary["outside"], [])
+        self.assertIsNone(summary["needed"])
+        for f in range(8):
+            rows, cols = mask[f].any(1).nonzero().flatten(), mask[f].any(0).nonzero().flatten()
+            self.assertTrue(torch.allclose(result["result"][0][f, rows[0], cols[0]], torch.tensor([1.0, 0.85, 0.1])))
 
 
 if __name__ == "__main__":

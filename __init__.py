@@ -727,11 +727,88 @@ def box_pixels(box, h, w):
     return top, max(top + 1, math.ceil((y + height) * h - 1e-6)), left, max(left + 1, math.ceil((x + width) * w - 1e-6))
 
 
+def placement_person(track_data, boxes):
+    packed = track_data["packed_masks"]
+    if packed is None:
+        return None
+    th, tw = packed.shape[2], packed.shape[3] * 8
+    columns = torch.arange(tw, device=packed.device, dtype=torch.float32)
+    best = None
+    for i in range(packed.shape[1]):
+        person = unpack_masks(packed[:, i])
+        area = person.sum((1, 2)).float()
+        on = (area > 0).tolist()
+        if sum(on) < len(boxes) / 4:
+            continue
+        centers = ((person.sum(1) * columns).sum(1) / area.clamp(min=1)).tolist()
+        gap = sum(abs(c / tw - (b[0] + b[2] / 2)) for c, b, o in zip(centers, boxes, on) if o) / sum(on)
+        if best is None or gap < best[0]:
+            best = (gap, person, centers, on)
+    if best is None:
+        return None
+    _, person, centers, on = best
+    rows = person.any(2)
+    tops = torch.where(rows, torch.arange(th, device=rows.device), th).amin(1).tolist()
+    bottoms = torch.where(rows, torch.arange(th, device=rows.device), -1).amax(1).tolist()
+    floor = max(bottoms)
+    tall = floor - min(t for t, o in zip(tops, on) if o) + 1
+    center = sum(c for c, o in zip(centers, on) if o) / sum(on)
+    return person, center, floor, tall
+
+
+def placement_pose(person, box, center, floor, tall, grid):
+    th, tw = person.shape
+    ys, xs = grid
+    top, bottom, left, right = box
+    scale = (bottom - top) / tall
+    gx = ((xs + 0.5 - (left + right) / 2) / scale + center + 0.5) / tw * 2 - 1
+    gy = ((ys + 0.5 - bottom) / scale + floor + 1) / th * 2 - 1
+    return F.grid_sample(person[None, None].float(), torch.stack((gx, gy), -1)[None], align_corners=False)[0, 0] > 0.5
+
+
+class H3AddMovingArea:
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = H3ObjectPlacementMask.INPUT_TYPES()
+        inputs["required"]["track_data"] = ("SAM3_TRACK_DATA",)
+        return inputs
+
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "build"
+    CATEGORY = "conditioning/minimax/context_loop"
+    DESCRIPTION = "For an Add that copies someone's routine: move their pose into the placement box and follow it with the edit area, leaving room for arms and legs. No person found: keep the fixed box."
+
+    def build(self, images, placement, track_data, start_frame=0):
+        mask = H3ObjectPlacementMask().build(images, placement, start_frame)[0]
+        boxes = placement_boxes(placement, start_frame, len(images))
+        placed = placement_person(track_data, boxes)
+        if placed is None:
+            return (mask,)
+        person, center, floor, tall = placed
+        th, tw = person.shape[1:]
+        h, w = images.shape[1:3]
+        mh, mw = mask.shape[1:]
+        grid = torch.meshgrid(torch.arange(th, device=person.device, dtype=torch.float32), torch.arange(tw, device=person.device, dtype=torch.float32), indexing="ij")
+        for f, box in enumerate(boxes):
+            ghost = placement_pose(person[f], box_pixels(box, th, tw), center, floor, tall, grid)
+            rows, cols = ghost.any(1).nonzero().flatten(), ghost.any(0).nonzero().flatten()
+            if not len(rows):
+                continue
+            margin_y = math.ceil(0.08 * box[3] * mh)
+            margin_x = math.ceil(0.08 * box[3] * h / w * mw)
+            top, bottom = max(0, math.floor(int(rows[0]) / th * mh) - margin_y), min(mh, math.ceil((int(rows[-1]) + 1) / th * mh) + margin_y)
+            left, right = max(0, math.floor(int(cols[0]) / tw * mw) - margin_x), min(mw, math.ceil((int(cols[-1]) + 1) / tw * mw) + margin_x)
+            mask[f].zero_()
+            mask[f, top:bottom, left:right] = 1
+        return (mask,)
+
+
 class H3AddFitCheck:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {"images": ("IMAGE", {"tooltip": "The frames SAM tracked the people in."}), "track_data": ("SAM3_TRACK_DATA",),
-                             "placement": ("STRING", {"multiline": True}), "start_frame": ("INT", {"default": 0, "min": 0, "max": 0x7fffffff})}}
+                             "placement": ("STRING", {"multiline": True}), "start_frame": ("INT", {"default": 0, "min": 0, "max": 0x7fffffff})},
+                "optional": {"moving_area": ("BOOLEAN", {"default": False})}}
 
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("preview",)
@@ -741,37 +818,28 @@ class H3AddFitCheck:
     DESCRIPTION = ("Before adding someone who copies a person's routine: moves the person nearest the placement box into it, scaled to the box "
                    "height and standing on its bottom edge, and shows where their movement leaves the box (green inside, red outside).")
 
-    def check(self, images, track_data, placement, start_frame=0):
+    def check(self, images, track_data, placement, start_frame=0, moving_area=False):
         n, h, w = images.shape[:3]
         boxes = placement_boxes(placement, start_frame, n)
-        packed = track_data["packed_masks"]
-        summary = {"frames": n, "person": False, "outside": [], "needed": None}
+        summary = {"frames": n, "person": False, "moving": moving_area, "outside": [], "needed": None}
+        edit_boxes = boxes
+        if moving_area:
+            masks = H3AddMovingArea().build(images, placement, track_data, start_frame)[0]
+            mh, mw = masks.shape[1:]
+            edit_boxes = []
+            for mask in masks:
+                rows, cols = mask.any(1).nonzero().flatten(), mask.any(0).nonzero().flatten()
+                top, bottom, left, right = int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1
+                edit_boxes.append((left / mw, top / mh, (right - left) / mw, (bottom - top) / mh))
         preview = images[..., :3] * 0.75
-        person = None
-        if packed is not None:
-            th, tw = packed.shape[2], packed.shape[3] * 8
-            columns = torch.arange(tw, device=packed.device, dtype=torch.float32)
-            best = None
-            for i in range(packed.shape[1]):
-                m = unpack_masks(packed[:, i])
-                area = m.sum((1, 2)).float()
-                on = (area > 0).tolist()
-                if sum(on) < n / 4:
-                    continue
-                centers = ((m.sum(1) * columns).sum(1) / area.clamp(min=1) / tw).tolist()
-                gap = sum(abs(c - (b[0] + b[2] / 2)) for c, b, o in zip(centers, boxes, on) if o) / sum(on)
-                if best is None or gap < best[0]:
-                    best = (gap, m, centers, on)
-            if best is not None:
-                _, person, centers, on = best
-        if person is not None:
+        placed = placement_person(track_data, boxes)
+        if placed is not None:
+            person, center, floor, tall = placed
+            th, tw = person.shape[1:]
+            columns = torch.arange(tw, device=person.device, dtype=torch.float32)
             row_counts, column_counts = person.sum(2), person.sum(1)
             rows = row_counts > 0
-            tops = torch.where(rows, torch.arange(th, device=rows.device), th).amin(1).tolist()
-            bottoms = torch.where(rows, torch.arange(th, device=rows.device), -1).amax(1).tolist()
-            floor = max(bottoms)
-            tall = floor - min(t for t, o in zip(tops, on) if o) + 1
-            center = sum(c for c, o in zip(centers, on) if o) / sum(on) * tw
+            on = rows.any(1).tolist()
             row_positions = torch.arange(th, device=person.device, dtype=torch.float32)
             ys, xs = torch.meshgrid(row_positions, columns, indexing="ij")
             pixel_boxes = [box_pixels(box, th, tw) for box in boxes]
@@ -783,17 +851,16 @@ class H3AddFitCheck:
                     continue
                 # Fit the routine's full vertical range, including jumps, with its lowest point on the box's bottom edge.
                 s = (bottom - top) / tall
-                gx = ((xs + 0.5 - (left + right) / 2) / s + center + 0.5) / tw * 2 - 1
-                gy = ((ys + 0.5 - bottom) / s + floor + 1) / th * 2 - 1
-                ghost = F.grid_sample(person[f][None, None].float(), torch.stack((gx, gy), -1)[None], align_corners=False)[0, 0] > 0.5
+                ghost = placement_pose(person[f], (top, bottom, left, right), center, floor, tall, (ys, xs))
+                edit_top, edit_bottom, edit_left, edit_right = box_pixels(edit_boxes[f], th, tw)
                 inside = torch.zeros_like(ghost)
-                inside[top:bottom, left:right] = True
+                inside[edit_top:edit_bottom, edit_left:edit_right] = True
                 out = ghost & ~inside
                 # Count the complete pose in source space, including parts beyond the video frame.
                 px = (columns - center) * s + (left + right) / 2
                 py = (row_positions - floor - 0.5) * s + bottom
-                sides = (("left", (left - px) / s + 0.5, column_counts[f]), ("right", (px - right) / s + 0.5, column_counts[f]),
-                         ("top", (top - py) / s + 0.5, row_counts[f]), ("bottom", (py - bottom) / s + 0.5, row_counts[f]))
+                sides = (("left", (edit_left - px) / s + 0.5, column_counts[f]), ("right", (px - edit_right) / s + 0.5, column_counts[f]),
+                         ("top", (edit_top - py) / s + 0.5, row_counts[f]), ("bottom", (py - edit_bottom) / s + 0.5, row_counts[f]))
                 area = int(row_counts[f].sum())
                 flagged.append([side for side, fraction, counts in sides if float((fraction.clamp(0, 1) * counts).sum()) > 0.02 * area])
                 green, red = big(ghost & inside), big(out)
@@ -812,12 +879,12 @@ class H3AddFitCheck:
             # Keep equal room either side of the anchor; an asymmetric tight box would move the pose again.
             height = min(max(bottom - top for top, bottom, left, right in pixel_boxes), math.floor((tw - 2) * tall / (2 * radius)))
             width = math.ceil(2 * radius * height / tall) + 2
-            if height > 0 and width <= tw:
+            if not moving_area and height > 0 and width <= tw:
                 top, bottom, left, right = pixel_boxes[0]
                 left = max(0, min(tw - width, round((left + right - width) / 2)))
                 top = max(0, min(th - height, bottom - height))
                 summary["needed"] = {"x": left / tw, "y": top / th, "width": width / tw, "height": height / th}
-        for f, box in enumerate(boxes):
+        for f, box in enumerate(edit_boxes):
             top, bottom, left, right = box_pixels(box, h, w)
             edge = max(1, round(h / 200))
             for part in (preview[f, top:top + edge, left:right], preview[f, max(top, bottom - edge):bottom, left:right],
@@ -1777,7 +1844,7 @@ NODE_CLASS_MAPPINGS = {"H3OneClickSwapPlan": H3OneClickSwapPlan, "H3AdvancedSwap
                        "H3TrackCrops": H3TrackCrops, "H3TrackRoles": H3TrackRoles, "H3RoleMask": H3RoleMask, "H3SubjectPrompt": H3SubjectPrompt,
                        "H3MontagePeople": H3MontagePeople, "H3MontagePlan": H3MontagePlan, "H3MontagePass": H3MontagePass,
                        "H3MontageTracks": H3MontageTracks, "H3MontagePicks": H3MontagePicks, "H3ObjectSwapPlan": H3ObjectSwapPlan, "H3SoundtrackOrSilence": H3SoundtrackOrSilence,
-                       "H3ObjectPlacementMask": H3ObjectPlacementMask, "H3AddFitCheck": H3AddFitCheck, "H3PaintedEditArea": H3PaintedEditArea, "H3FaceChunks": H3FaceChunks, "H3FaceJoin": H3FaceJoin}
+                       "H3ObjectPlacementMask": H3ObjectPlacementMask, "H3AddFitCheck": H3AddFitCheck, "H3AddMovingArea": H3AddMovingArea, "H3PaintedEditArea": H3PaintedEditArea, "H3FaceChunks": H3FaceChunks, "H3FaceJoin": H3FaceJoin}
 NODE_DISPLAY_NAME_MAPPINGS = {"H3OneClickSwapPlan": "H3 One-Click Swap Plan", "H3AdvancedSwapPlan": "H3 Advanced Swap Plan (labelled roles)",
                               "H3PictureSwapPlan": "H3 Picture Swap Plan (person + setting from the picture)",
                               "H3GreyMannequins": "H3 Grey Mannequins (hide people)", "H3PeopleMask": "H3 People Mask (headroom per person)",
@@ -1788,5 +1855,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {"H3OneClickSwapPlan": "H3 One-Click Swap Plan", "H
                               "H3MontagePass": "H3 Montage Pass (this clip's person)", "H3MontageTracks": "H3 Montage Tracks (from Find people)", "H3MontagePicks": "H3 Montage Picks (no review)",
                               "H3ObjectSwapPlan": "H3 Object Swap Plan (change, remove, background, add)", "H3SoundtrackOrSilence": "H3 Soundtrack (silence if none)",
                               "H3ObjectPlacementMask": "H3 Object Placement Mask (keyframed box)", "H3AddFitCheck": "H3 Add Fit Check (does their routine fit the box)",
+                              "H3AddMovingArea": "H3 Add Moving Area (follows the copied routine)",
                               "H3PaintedEditArea": "H3 Painted Edit Area (follows tracked mask)",
                               "H3FaceChunks": "H3 Face Fix Chunks", "H3FaceJoin": "H3 Face Fix Join"}
