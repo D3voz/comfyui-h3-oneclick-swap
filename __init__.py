@@ -659,6 +659,24 @@ class H3ObjectSwapPlan:
         return (plan_json("edit", prompts, clips, overlap_frames, steps, seed), out_w, out_h, run_name, EDIT_SHOTS_PROMPT % never)
 
 
+class H3SoundtrackOrSilence:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"audio": ("AUDIO",), "video_info": ("VHS_VIDEOINFO",)}}
+
+    RETURN_TYPES = ("AUDIO",)
+    FUNCTION = "soundtrack"
+    CATEGORY = "conditioning/minimax/context_loop"
+    DESCRIPTION = "The video's soundtrack, or silence as long as the loaded frames when the video has no audio stream."
+
+    def soundtrack(self, audio, video_info):
+        try:
+            return ({"waveform": audio["waveform"], "sample_rate": audio["sample_rate"]},)
+        except Exception:  # VHS loads the audio lazily and raises a bare Exception when the file has no audio stream
+            samples = round(video_info["loaded_duration"] * 44100)
+            return ({"waveform": torch.zeros(1, 2, samples), "sample_rate": 44100},)
+
+
 class H3ObjectPlacementMask:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1647,7 +1665,7 @@ NODE_CLASS_MAPPINGS = {"H3OneClickSwapPlan": H3OneClickSwapPlan, "H3AdvancedSwap
                        "H3PeopleMask": H3PeopleMask, "H3ClipShots": H3ClipShots, "H3FillShots": H3FillShots,
                        "H3TrackCrops": H3TrackCrops, "H3TrackRoles": H3TrackRoles, "H3RoleMask": H3RoleMask, "H3SubjectPrompt": H3SubjectPrompt,
                        "H3MontagePeople": H3MontagePeople, "H3MontagePlan": H3MontagePlan, "H3MontagePass": H3MontagePass,
-                       "H3MontageTracks": H3MontageTracks, "H3MontagePicks": H3MontagePicks, "H3ObjectSwapPlan": H3ObjectSwapPlan,
+                       "H3MontageTracks": H3MontageTracks, "H3MontagePicks": H3MontagePicks, "H3ObjectSwapPlan": H3ObjectSwapPlan, "H3SoundtrackOrSilence": H3SoundtrackOrSilence,
                        "H3ObjectPlacementMask": H3ObjectPlacementMask, "H3PaintedEditArea": H3PaintedEditArea, "H3FaceChunks": H3FaceChunks, "H3FaceJoin": H3FaceJoin}
 NODE_DISPLAY_NAME_MAPPINGS = {"H3OneClickSwapPlan": "H3 One-Click Swap Plan", "H3AdvancedSwapPlan": "H3 Advanced Swap Plan (labelled roles)",
                               "H3PictureSwapPlan": "H3 Picture Swap Plan (person + setting from the picture)",
@@ -1657,7 +1675,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {"H3OneClickSwapPlan": "H3 One-Click Swap Plan", "H
                               "H3RoleMask": "H3 Role Mask (labelled people only)", "H3SubjectPrompt": "H3 Subject Prompt (one pass per person)",
                               "H3MontagePeople": "H3 Montage People (save for the person list)", "H3MontagePlan": "H3 Montage Plan (labels, seed, size)",
                               "H3MontagePass": "H3 Montage Pass (this clip's person)", "H3MontageTracks": "H3 Montage Tracks (from Find people)", "H3MontagePicks": "H3 Montage Picks (no review)",
-                              "H3ObjectSwapPlan": "H3 Object Swap Plan (change, remove, background, add)",
+                              "H3ObjectSwapPlan": "H3 Object Swap Plan (change, remove, background, add)", "H3SoundtrackOrSilence": "H3 Soundtrack (silence if none)",
                               "H3ObjectPlacementMask": "H3 Object Placement Mask (keyframed box)",
                               "H3PaintedEditArea": "H3 Painted Edit Area (follows tracked mask)",
                               "H3FaceChunks": "H3 Face Fix Chunks", "H3FaceJoin": "H3 Face Fix Join"}
