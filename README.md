@@ -39,6 +39,7 @@ The workflow IDs below are stable identifiers; the names displayed in ComfyUI ar
 | `H3AdvancedSwapPlan` | Add role labels and per-subject prompts for Advanced swaps. |
 | `H3ObjectSwapPlan` | Plan Change, Remove, Background and Add edits. |
 | `H3ObjectPlacementMask` | Build placement masks from normalized box keyframes for adding an object. |
+| `H3PaintedEditArea` | Move and scale painted edit keyframes with the tracked part's bounding box. |
 | `H3PeopleMask` | Build masks with per-person headroom and temporal holding. |
 | `H3GreyMannequins` | Make grey motion references that hide the original person's appearance. |
 | `H3ClipShots` | Find hard cuts and prepare shot-description frames. |
@@ -99,3 +100,11 @@ The workflow's model loaders select the actual files. Fix faces also requires th
 ## License
 
 MIT. See [LICENSE](LICENSE). Model weights and companion packs have their own licenses.
+
+### Painted Change edits
+
+`H3PaintedEditArea` takes a full tracked `MASK` timeline without temporal hold, a `paint` JSON string, its `start_frame`, and the output canvas `width` and `height`. It matches the source clip's centre crop at SAM's scale. Each keyframe is `{ "frame": 0, "width": 144, "height": 256, "runs": [start, length, ...] }`: ordered foreground runs in a row-major screen mask, at most 256 pixels per side. Frames are relative to the selected section at 24 fps.
+
+The node anchors each painting to SAM's bounding box at its painted frame, interpolates the relative bounds and shape between keyframes, and unions the result with the tracked mask. An empty track has no paint; a painting with no track at its anchor is skipped. Motion and scale follow the combined tracked bbox, without rotation. Incorrect or oversized SAM detections also move or enlarge the painting.
+
+In Openjutsu, Change with paint tracks the full section once, then `MiniMaxH3ContexLoopMaskSlice` selects each generation clip before Grow Mask. Pass the same paint string to `H3ObjectSwapPlan` to invalidate resumed clips when repainting. Empty paint preserves the existing Change prompt and run hash.
