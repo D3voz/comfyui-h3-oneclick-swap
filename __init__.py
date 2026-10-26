@@ -332,6 +332,54 @@ class H3PictureSwapPlan(H3OneClickSwapPlan):
                          steps, seed, roles, video_people, no_lip_sync, setting_from_picture=True)[:5]
 
 
+def build_scene_prompt(desc, role, length, overlap, lip_sync=True):
+    summary = ("[video editing + reference generation + audio reuse] Recreate <Video 1> with the complete appearance of <Picture 1>. "
+               "The person, surroundings, materials, colours and illumination come from the picture. "
+               "The source supplies the performance, framing, camera motion and timing. ")
+    if overlap:
+        summary += "Its first %.3f seconds continue the already-generated footage from the preceding section. " % (overlap / FPS)
+    return "\n".join([
+        "subject_definitions:",
+        "<Subject 1> is the person from <Picture 1>. %sThey perform the actions of %s in <Video 1>." % (desc + " " if desc else "", role),
+        "<Subject 2> is the entire environment, props, colours and lighting of <Picture 1>.",
+        "<Video 1> is a %.3f-second motion guide at 24 fps. Its grey figure supplies body poses, gestures, footwork, "
+        "expressions and timing. Its flat grey surroundings carry no appearance or lighting to preserve." % (length / FPS),
+        "<Picture 1> defines the complete visual appearance and composition of the recreated scene.",
+        "<Audio 1> is the original synchronized soundtrack, reused unchanged.",
+        "", "summary:", summary,
+        "", "retention_analysis:",
+        "<Subject 1>: fully_preserved - identity, hair, skin and complete outfit come from <Picture 1>.",
+        "<Subject 2>: fully_preserved - the picture's environment and illumination fill the entire frame throughout the clip.",
+        "<Video 1>: partially_preserved - retain the performance, framing, camera movement, cuts and timing. "
+        "Replace its original visual appearance and lighting across the whole frame.",
+        "<Audio 1>: fully_copy - reuse the original soundtrack without additional sounds.",
+        "", "detailed_description:",
+        "Live-action footage with the setting and lighting of <Picture 1>. The illumination stays coherent on the person, "
+        "surfaces and contact shadows as the person moves. The picture is a visual reference, not a still image held on screen.",
+        SHOTS_PLACEHOLDER,
+        "<Subject 1> performs the same movements as the grey figure in <Video 1>, at the same moments, through the last frame. "
+        + (LIP_SYNC if lip_sync else NO_LIP_SYNC),
+        "", SOUND,
+    ])
+
+
+class H3SceneSwapPlan(H3PictureSwapPlan):
+    DESCRIPTION = "Recreate the whole source clip with the person, setting and lighting of a picture, following a grey motion-reference video."
+
+    def build(self, source_frames, picture_1, clip_seconds, overlap_frames, resolution, steps, seed, roles,
+              picture_1_text="", video_people="", no_lip_sync=False, short_edge=0):
+        person = (numbered_lines(roles) or numbered_lines(video_people) or ordinal_people(1))[0]
+        role = neutral_words(split_person(person)[0])
+        desc = " ".join(picture_1_text.split())
+        if desc and not desc.endswith("."):
+            desc += "."
+        clips, width, height = plan_clips(source_frames, clip_seconds, overlap_frames, short_edge or RESOLUTIONS[resolution])
+        prompts = [build_scene_prompt(desc, role, length, overlap, not no_lip_sync) for length, overlap in clips]
+        name = "scene_" + run_hash(source_frames, [picture_1], [role, desc, clips, width, height, steps, seed, no_lip_sync])
+        shots = SHOTS_PROMPT % ("<Subject 1>: " + person) + SETTING_SHOTS
+        return plan_json("scene", prompts, clips, overlap_frames, steps, seed), width, height, name, shots
+
+
 MONTAGE_PASSES = 2
 
 
@@ -1146,6 +1194,7 @@ class H3GreyMannequins:
             "optional": {
                 "faces": ("MASK", {"tooltip": "Faces from H3 People Mask on a SAM 'face' track. They get the lighter face_blur and keep their lips darker than the skin, so H3 sees when mouths open and close."}),
                 "face_size": ("MASK", {"tooltip": "Per-pixel face height from the same H3 People Mask."}),
+                "neutral_background": ("BOOLEAN", {"default": False, "tooltip": "Replace the surroundings with flat grey so a scene reference supplies the setting and lighting."}),
                 "face_blur": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 0.5, "step": 0.005, "tooltip": "Blur inside faces as a share of the face's height (1 to 8 px)."}),
             },
         }
@@ -1156,7 +1205,7 @@ class H3GreyMannequins:
     DESCRIPTION = ("Turns the masked people into smooth light-grey figures that keep their pose and shading but not their face, "
                    "hair colour or clothes, so a motion reference cannot pull the original people back into the edit.")
 
-    def hide(self, images, mask, size, blur, faces=None, face_size=None, face_blur=0.05):
+    def hide(self, images, mask, size, blur, faces=None, face_size=None, face_blur=0.05, neutral_background=False):
         n, h, w = images.shape[:3]
         dev = comfy.model_management.get_torch_device()
         out = torch.empty_like(images)
@@ -1173,7 +1222,7 @@ class H3GreyMannequins:
                 # Faces use the green channel, where lips are darker than skin, so a closed or open mouth still reads in grey.
                 luma = torch.lerp(luma, graded_blur(f[:, 1:2], face_height * face_blur), face)
             grey = (0.45 + 0.45 * luma).expand(-1, 3, -1, -1)
-            out[i:i + 16] = torch.lerp(f, grey, m).movedim(1, -1).to(out.device, out.dtype)
+            out[i:i + 16] = torch.lerp(torch.full_like(f, 0.5) if neutral_background else f, grey, m).movedim(1, -1).to(out.device, out.dtype)
         return (out,)
 
 
@@ -1839,14 +1888,14 @@ class H3FillShots:
         return (prompt.replace(SHOTS_PLACEHOLDER, shots),)
 
 
-NODE_CLASS_MAPPINGS = {"H3OneClickSwapPlan": H3OneClickSwapPlan, "H3AdvancedSwapPlan": H3AdvancedSwapPlan, "H3PictureSwapPlan": H3PictureSwapPlan, "H3GreyMannequins": H3GreyMannequins,
+NODE_CLASS_MAPPINGS = {"H3OneClickSwapPlan": H3OneClickSwapPlan, "H3AdvancedSwapPlan": H3AdvancedSwapPlan, "H3PictureSwapPlan": H3PictureSwapPlan, "H3SceneSwapPlan": H3SceneSwapPlan, "H3GreyMannequins": H3GreyMannequins,
                        "H3PeopleMask": H3PeopleMask, "H3ClipShots": H3ClipShots, "H3FillShots": H3FillShots,
                        "H3TrackCrops": H3TrackCrops, "H3TrackRoles": H3TrackRoles, "H3RoleMask": H3RoleMask, "H3SubjectPrompt": H3SubjectPrompt,
                        "H3MontagePeople": H3MontagePeople, "H3MontagePlan": H3MontagePlan, "H3MontagePass": H3MontagePass,
                        "H3MontageTracks": H3MontageTracks, "H3MontagePicks": H3MontagePicks, "H3ObjectSwapPlan": H3ObjectSwapPlan, "H3SoundtrackOrSilence": H3SoundtrackOrSilence,
                        "H3ObjectPlacementMask": H3ObjectPlacementMask, "H3AddFitCheck": H3AddFitCheck, "H3AddMovingArea": H3AddMovingArea, "H3PaintedEditArea": H3PaintedEditArea, "H3FaceChunks": H3FaceChunks, "H3FaceJoin": H3FaceJoin}
 NODE_DISPLAY_NAME_MAPPINGS = {"H3OneClickSwapPlan": "H3 One-Click Swap Plan", "H3AdvancedSwapPlan": "H3 Advanced Swap Plan (labelled roles)",
-                              "H3PictureSwapPlan": "H3 Picture Swap Plan (person + setting from the picture)",
+                              "H3PictureSwapPlan": "H3 Picture Swap Plan (person + setting from the picture)", "H3SceneSwapPlan": "H3 Scene Swap Plan (picture + motion)",
                               "H3GreyMannequins": "H3 Grey Mannequins (hide people)", "H3PeopleMask": "H3 People Mask (headroom per person)",
                               "H3ClipShots": "H3 Clip Shots (find cuts)", "H3FillShots": "H3 Fill Shot List",
                               "H3TrackCrops": "H3 Track Crops (who is each track)", "H3TrackRoles": "H3 Track Roles (read labels)",
