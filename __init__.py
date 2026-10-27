@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+import comfy.audio
 import comfy.model_management
 import comfy.utils
 import folder_paths
@@ -723,6 +724,43 @@ class H3SoundtrackOrSilence:
         except Exception:  # VHS loads the audio lazily and raises a bare Exception when the file has no audio stream
             samples = round(video_info["loaded_duration"] * 44100)
             return ({"waveform": torch.zeros(1, 2, samples), "sample_rate": 44100},)
+
+
+class H3SourceSlice:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"state": ("H3_CHAIN_STATE", {"tooltip": "Current state from H3 Chain Current Shot."}),
+                             "latent": ("LATENT", {"tooltip": "The current H3 target; sets the frame size."}),
+                             "audio_vae": ("VAE", {"tooltip": "The H3 audio VAE; sets the audio sample rate. Nothing is encoded."}),
+                             "source_frames": ("IMAGE",),
+                             "source_audio": ("AUDIO",),
+                             "source_fps": ("FLOAT", {"default": 24.0, "min": 0.001, "max": 1000.0, "step": 0.001}),
+                             "crop": (["disabled", "center"], {"default": "center"})}}
+
+    RETURN_TYPES = ("IMAGE", "AUDIO")
+    RETURN_NAMES = ("scene_frames", "scene_audio")
+    FUNCTION = "slice"
+    CATEGORY = "conditioning/minimax/context_loop"
+    DESCRIPTION = "The current Chain Loop scene's source frames and audio at 24 fps, sized to the H3 target. Like Context-Loop's Loop Source AV Target without the VAE encodes."
+
+    def slice(self, state, latent, audio_vae, source_frames, source_audio, source_fps=24.0, crop="center"):
+        shot = state["plan"]["shots"][int(state["index"]) - 1]
+        start, n = int(shot["generation_start_frame"]), int(shot["raw_frames"])
+        last = source_frames.shape[0] - 1
+        picks = [min(round((i + 0.5) * source_fps / FPS - 0.5), last) for i in range(start, start + n)]
+        video = latent["samples"].tensors[0]
+        frames = comfy.utils.common_upscale(source_frames[picks][..., :3].movedim(-1, 1), video.shape[4] * 16, video.shape[3] * 16, "lanczos", crop).movedim(1, -1)
+
+        rate = audio_vae.audio_sample_rate
+        waveform = source_audio["waveform"][:1]
+        if waveform.shape[1] == 1:
+            waveform = waveform.repeat(1, 2, 1)
+        if source_audio["sample_rate"] != rate:
+            waveform = comfy.audio.resample(waveform, source_audio["sample_rate"], rate)
+        offset, length = round(start / FPS * rate), round(n / FPS * rate)
+        audio = waveform[..., offset:offset + length]
+        audio = F.pad(audio, (0, length - audio.shape[-1]))
+        return (frames, {"waveform": audio, "sample_rate": rate})
 
 
 class H3ObjectPlacementMask:
@@ -1892,7 +1930,7 @@ NODE_CLASS_MAPPINGS = {"H3OneClickSwapPlan": H3OneClickSwapPlan, "H3AdvancedSwap
                        "H3PeopleMask": H3PeopleMask, "H3ClipShots": H3ClipShots, "H3FillShots": H3FillShots,
                        "H3TrackCrops": H3TrackCrops, "H3TrackRoles": H3TrackRoles, "H3RoleMask": H3RoleMask, "H3SubjectPrompt": H3SubjectPrompt,
                        "H3MontagePeople": H3MontagePeople, "H3MontagePlan": H3MontagePlan, "H3MontagePass": H3MontagePass,
-                       "H3MontageTracks": H3MontageTracks, "H3MontagePicks": H3MontagePicks, "H3ObjectSwapPlan": H3ObjectSwapPlan, "H3SoundtrackOrSilence": H3SoundtrackOrSilence,
+                       "H3MontageTracks": H3MontageTracks, "H3MontagePicks": H3MontagePicks, "H3ObjectSwapPlan": H3ObjectSwapPlan, "H3SoundtrackOrSilence": H3SoundtrackOrSilence, "H3SourceSlice": H3SourceSlice,
                        "H3ObjectPlacementMask": H3ObjectPlacementMask, "H3AddFitCheck": H3AddFitCheck, "H3AddMovingArea": H3AddMovingArea, "H3PaintedEditArea": H3PaintedEditArea, "H3FaceChunks": H3FaceChunks, "H3FaceJoin": H3FaceJoin}
 NODE_DISPLAY_NAME_MAPPINGS = {"H3OneClickSwapPlan": "H3 One-Click Swap Plan", "H3AdvancedSwapPlan": "H3 Advanced Swap Plan (labelled roles)",
                               "H3PictureSwapPlan": "H3 Picture Swap Plan (person + setting from the picture)", "H3SceneSwapPlan": "H3 Scene Swap Plan (picture + motion)",
@@ -1902,7 +1940,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {"H3OneClickSwapPlan": "H3 One-Click Swap Plan", "H
                               "H3RoleMask": "H3 Role Mask (labelled people only)", "H3SubjectPrompt": "H3 Subject Prompt (one pass per person)",
                               "H3MontagePeople": "H3 Montage People (save for the person list)", "H3MontagePlan": "H3 Montage Plan (labels, seed, size)",
                               "H3MontagePass": "H3 Montage Pass (this clip's person)", "H3MontageTracks": "H3 Montage Tracks (from Find people)", "H3MontagePicks": "H3 Montage Picks (no review)",
-                              "H3ObjectSwapPlan": "H3 Object Swap Plan (change, remove, background, add)", "H3SoundtrackOrSilence": "H3 Soundtrack (silence if none)",
+                              "H3ObjectSwapPlan": "H3 Object Swap Plan (change, remove, background, add)", "H3SoundtrackOrSilence": "H3 Soundtrack (silence if none)", "H3SourceSlice": "H3 Source Slice (scene frames + audio)",
                               "H3ObjectPlacementMask": "H3 Object Placement Mask (keyframed box)", "H3AddFitCheck": "H3 Add Fit Check (does their routine fit the box)",
                               "H3AddMovingArea": "H3 Add Moving Area (follows the copied routine)",
                               "H3PaintedEditArea": "H3 Painted Edit Area (follows tracked mask)",
