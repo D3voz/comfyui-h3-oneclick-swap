@@ -716,14 +716,16 @@ class H3SoundtrackOrSilence:
     RETURN_TYPES = ("AUDIO",)
     FUNCTION = "soundtrack"
     CATEGORY = "conditioning/minimax/context_loop"
-    DESCRIPTION = "The video's soundtrack, or silence as long as the loaded frames when the video has no audio stream."
+    DESCRIPTION = "The video's soundtrack padded with silence to the loaded frames, or only silence when the video has no audio stream."
 
     def soundtrack(self, audio, video_info):
         try:
-            return ({"waveform": audio["waveform"], "sample_rate": audio["sample_rate"]},)
+            waveform, rate = audio["waveform"], audio["sample_rate"]
         except Exception:  # VHS loads the audio lazily and raises a bare Exception when the file has no audio stream
-            samples = round(video_info["loaded_duration"] * 44100)
-            return ({"waveform": torch.zeros(1, 2, samples), "sample_rate": 44100},)
+            waveform, rate = torch.zeros(1, 2, 0), 44100
+        # Source Timeline takes the source length from the audio (rounding down), so it must cover every loaded frame
+        samples = math.ceil(video_info["loaded_duration"] * rate)
+        return ({"waveform": F.pad(waveform, (0, max(0, samples - waveform.shape[-1]))), "sample_rate": rate},)
 
 
 class H3SourceSlice:
