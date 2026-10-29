@@ -55,6 +55,7 @@ The workflow IDs below are stable identifiers; the names displayed in ComfyUI ar
 | `H3MontagePass` | Select the subject, photo and prompt for the current Montage pass. |
 | `H3FaceChunks` | Split face crops into independent overlapping H3 refinement chunks. |
 | `H3FaceJoin` | Crossfade refined face chunks before stitching them back. |
+| `H3RelightPass` | Shine a movable 3D light or a shaped preset (eye slit, blinds, window, neon) on Metric3D normals and Depth Anything depth, aimed at the eyes from optional DWPose keypoints, giving a rough relight and light words for FLUX 3 Klein. |
 
 ## Workflow setup
 

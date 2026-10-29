@@ -1928,12 +1928,185 @@ class H3FillShots:
         return (prompt.replace(SHOTS_PLACEHOLDER, shots),)
 
 
+# Virtual lights for relighting a frame with an image editor. Directions point toward the light (x right, y up,
+# z toward the camera); colours are linear; a gobo is a cut-out in front of the light, sized in frame heights
+# around the aim point. "words" describes the same light for the editor's prompt.
+RELIGHT_PRESETS = {
+    "3D light": dict(ambient=(0.012, 0.012, 0.016), lights=[dict(color=(1.0, 0.97, 0.92), power=2.6)]),  # placed by light_azimuth / light_elevation
+    "eye slit": dict(words="lit only by one thin, hard-edged horizontal strip of cold white light that falls across the eyes; the forehead, mouth, body and the room above and below the strip sit in near-black shadow",
+                     ambient=(0.015, 0.015, 0.02), lights=[dict(dir=(0, 0.05, 1), color=(1.0, 1.0, 1.05), power=3.0, gobo="slit", size=0.018, soft=0.006, shadows=False)]),
+    "blinds": dict(words="lit by warm low sunlight coming through venetian blinds from the left, casting sharp diagonal bands of golden light and dark shadow across the face, hair, clothes and the wall behind",
+                   ambient=(0.04, 0.045, 0.06), lights=[dict(dir=(-0.7, 0.35, 0.6), color=(1.2, 0.9, 0.6), power=2.6, gobo="blinds", size=0.03, soft=0.25)]),
+    "window": dict(words="lit by soft daylight through a four-pane window on the left, a bright window-shaped patch of light with the dark cross of the window frame falling across the face, the rest of the room dim",
+                   ambient=(0.04, 0.045, 0.055), lights=[dict(dir=(-0.6, 0.3, 0.75), color=(1.15, 1.05, 0.95), power=2.4, gobo="window", size=0.12, soft=0.01)]),
+    "neon duo": dict(words="lit by two coloured neon lights, hot magenta from the left side and electric cyan from the right side, each colour wrapping around its half of the face and body, dark room",
+                     ambient=(0.02, 0.02, 0.03), lights=[dict(dir=(-0.9, 0.1, 0.4), color=(1.4, 0.2, 0.9), power=2.0), dict(dir=(0.9, 0.1, 0.4), color=(0.1, 0.9, 1.4), power=2.0)]),
+}
+RELIGHT_RELIEF = 0.12  # disparity to depth, in frame heights
+
+
+def srgb_to_linear(x):
+    return torch.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+
+
+def linear_to_srgb(x):
+    x = x.clamp(0, 1)
+    return torch.where(x <= 0.0031308, x * 12.92, 1.055 * x ** (1 / 2.4) - 0.055)
+
+
+def smoothstep(e0, e1, x):
+    t = ((x - e0) / (e1 - e0)).clamp(0, 1)
+    return t * t * (3 - 2 * t)
+
+
+def relight_gobo(kind, a, b, size, soft):
+    """The cut-out's light (1) and shadow (0), at a across and b up on the plane facing the light."""
+    if kind == "slit":
+        return 1 - smoothstep(size, size + soft, b.abs())
+    if kind == "blinds":
+        return smoothstep(-soft, soft, torch.sin(b / size * math.pi))
+    if kind == "window":
+        frame = ((1 - smoothstep(0.015, 0.015 + soft, a.abs())) + (1 - smoothstep(0.015, 0.015 + soft, b.abs()))).clamp(0, 1)
+        return (1 - smoothstep(size, size + soft, a.abs())) * (1 - smoothstep(size, size + soft, b.abs())) * (1 - frame)
+    return torch.ones_like(a)
+
+
+def relight_3d_words(azimuth, elevation):
+    """The 3D light's position and look in words. Azimuth 0 is the camera, positive toward frame right, 180 behind."""
+    side = "left" if azimuth < 0 else "right"
+    az = abs(azimuth)
+    if elevation > 60:
+        return ("lit by a single white light directly overhead in a dark room, light on the top of the head, forehead, cheekbones "
+                "and shoulders, deep shadows under the brows, nose and chin")
+    if elevation < -60:
+        return ("lit from directly below by a single white light in a dark room, light on the underside of the chin, nose and "
+                "cheekbones and upward shadows over the eyes")
+    height = "high " if elevation > 20 else "low " if elevation < -20 else ""
+    if az <= 22.5:
+        return f"lit by a single {height}white light from the front in a dark room, the face and body evenly lit, the room black behind"
+    if az <= 67.5:
+        return (f"lit by a single {height}white light from the front {side} in a dark room, the {side} side of the face bright, "
+                f"soft shadow on the other side and under the nose and chin")
+    if az <= 112.5:
+        return (f"lit by a single hard {height}white light from the {side} side in a dark room, the {side} half of the face and "
+                f"body bright, the other half falling into deep shadow with a sharp line down the middle of the face")
+    if az <= 157.5:
+        return (f"lit by a single {height}white light from behind on the {side} in a dark room, a bright rim of light along the "
+                f"{side} edges of the hair, cheek, shoulder and arm, the face and front of the body in deep shadow")
+    return (f"lit by a single {height}white light from directly behind in a dark room, a thin bright rim of light outlining the "
+            f"hair, shoulders and body, the face and front of the body in near-black silhouette")
+
+
+def relight_shadow(P, L, steps=40, reach=0.15, bias=0.006, thickness=0.03):
+    """Ray march from each pixel toward a directional light over the depth map: 1 lit, 0 shadowed.
+    Occluders are taken as thickness deep, so a surface far in front of the ray does not block it."""
+    h, w = P.shape[:2]
+    zmap = P[None, None, :, :, 2]
+    lit = torch.ones(h, w, device=P.device)
+    for i in range(1, steps + 1):
+        q = P + reach * i / steps * L
+        gx, gy = q[..., 0] / (0.5 * w / h), -q[..., 1] / 0.5
+        surface = F.grid_sample(zmap, torch.stack((gx, gy), -1)[None], mode="bilinear", padding_mode="border", align_corners=True)[0, 0]
+        lit[(gx.abs() <= 1) & (gy.abs() <= 1) & (surface > q[..., 2] + bias) & (surface < q[..., 2] + thickness)] = 0
+    return lit
+
+
+class H3RelightPass:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "normals": ("IMAGE", {"tooltip": "Metric3D normal map (controlnet_aux colours), one per image or one for all."}),
+                "depth": ("IMAGE", {"tooltip": "Depth Anything V2 depth (near is white), one per image or one for all."}),
+                "preset": (list(RELIGHT_PRESETS), {"tooltip": "3D light: one light in a dark room, placed with light_azimuth and light_elevation. The others are shaped lights."}),
+                "light_azimuth": ("FLOAT", {"default": -45.0, "min": -180.0, "max": 180.0, "step": 5.0, "tooltip": "3D light only. Around the subject: 0 from the camera, -90 frame left, 90 frame right, ±180 from behind (rim light)."}),
+                "light_elevation": ("FLOAT", {"default": 30.0, "min": -90.0, "max": 90.0, "step": 5.0, "tooltip": "3D light only. 90 from directly above, 0 level with the subject, -90 from directly below."}),
+                "aim_x": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.005, "tooltip": "Where the slit, blinds or window are centred, as a share of the width. Put it on the face."}),
+                "aim_y": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.005, "tooltip": "Where the slit, blinds or window are centred, as a share of the height. For the eye slit, the eye line."}),
+                "power": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05}),
+                "size": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 5.0, "step": 0.05, "tooltip": "Scales the slit width, window panes and blind spacing."}),
+                "mirror": ("BOOLEAN", {"default": False, "tooltip": "Swap the lights' left and right sides."}),
+                "background": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Light left on the far background (from the depth); low values let the scene fall into darkness."}),
+                "shadow_strength": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "How dark cast shadows from the depth map are. They are rough, so the editor smooths them."}),
+                "gloss": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Highlights where each light reflects toward the camera (skin, eyes, hair)."}),
+            },
+            "optional": {
+                "pose": ("POSE_KEYPOINT", {"tooltip": "DWPose keypoints. When connected, the lights aim at the first person's eyes and aim_x / aim_y are ignored."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING")
+    RETURN_NAMES = ("relit", "light_map", "light_words")
+    OUTPUT_TOOLTIPS = ("The image under the new light, rough.", "The new light alone.", "The preset's light in words, for the prompt.")
+    FUNCTION = "relight"
+    CATEGORY = "image/relight"
+    DESCRIPTION = ("Shines virtual lights on the image's normals and depth: direction, shapes cut out in front of the light, rim light "
+                   "and rough cast shadows. Gives a rough relit image and a light map for an image editor such as FLUX 3 Klein to "
+                   "make photoreal, and words describing the light for its prompt.")
+
+    def relight(self, image, normals, depth, preset, light_azimuth, light_elevation, aim_x, aim_y, power, size, mirror, background, shadow_strength, gloss, pose=None):
+        cfg = RELIGHT_PRESETS[preset]
+        lights, words = cfg["lights"], cfg.get("words")
+        if preset == "3D light":
+            az, el = math.radians(light_azimuth), math.radians(light_elevation)
+            lights = [dict(lights[0], dir=(math.sin(az) * math.cos(el), math.sin(el), math.cos(az) * math.cos(el)))]
+            words = relight_3d_words(light_azimuth, light_elevation)
+        if pose and pose[0]["people"]:
+            # OpenPose body order: 0 nose, 14 and 15 the eyes; pixel coordinates on the pose canvas.
+            k = pose[0]["people"][0]["pose_keypoints_2d"]
+            eyes = [(k[j * 3], k[j * 3 + 1]) for j in (14, 15, 0) if k[j * 3 + 2] > 0][:2]
+            if eyes:
+                aim_x = sum(e[0] for e in eyes) / len(eyes) / pose[0]["canvas_width"]
+                aim_y = sum(e[1] for e in eyes) / len(eyes) / pose[0]["canvas_height"]
+        if mirror:
+            words = re.sub(r"\b(left|right)\b", lambda m: "right" if m.group(1) == "left" else "left", words)
+        n, h, w = image.shape[:3]
+        dev = comfy.model_management.get_torch_device()
+        relit = torch.empty_like(image)
+        light_map = torch.empty_like(image)
+        ys, xs = torch.meshgrid(torch.linspace(0.5, -0.5, h, device=dev), torch.linspace(-0.5 * w / h, 0.5 * w / h, w, device=dev), indexing="ij")
+        for i in range(n):
+            rgb = F.interpolate(normals[min(i, len(normals) - 1)][None].to(dev, torch.float32).movedim(-1, 1), size=(h, w), mode="bilinear")[0].movedim(0, -1)
+            # controlnet_aux stores 255 - (n * 127 + 128): red faces image-left, green faces up, blue faces the camera.
+            nrm = F.normalize(torch.stack((1 - 2 * rgb[..., 0], 2 * rgb[..., 1] - 1, 2 * rgb[..., 2] - 1), -1), dim=-1)
+            d = F.interpolate(depth[min(i, len(depth) - 1)][None, ..., :1].to(dev, torch.float32).movedim(-1, 1), size=(h, w), mode="bilinear")[0, 0]
+            d = (d - d.min()) / (d.max() - d.min()).clamp(min=1e-6)
+            P = torch.stack((xs, ys, d * RELIGHT_RELIEF), -1)
+            # Fine normals are noisy (fabric folds, a chin "facing down"); shading from blurred ones avoids black blotches the editor copies.
+            soft = F.normalize(gaussian_blur(nrm.permute(2, 0, 1)[:, None], 0.02 * h)[:, 0].permute(1, 2, 0), dim=-1)
+            shade = torch.zeros(h, w, 3, device=dev)
+            for lt in lights:
+                L = F.normalize(torch.tensor(lt["dir"], dtype=torch.float32, device=dev) * torch.tensor([-1.0 if mirror else 1.0, 1.0, 1.0], device=dev), dim=0)
+                # wrap lets light reach past the terminator, like skin and fabric scatter it
+                lam = ((soft @ L + 0.3) / 1.3).clamp(min=0)
+                if L[2] < 0:  # from behind, the light only reaches the edges turned away from the camera: a rim
+                    lam = lam - 2 * L[2] * (1 - nrm[..., 2]).clamp(min=0) ** 1.5 * (nrm @ L + 1) / 2
+                up = torch.tensor([0.0, 1.0, 0.0] if abs(L[1]) < 0.9 else [1.0, 0.0, 0.0], device=dev)
+                e1 = F.normalize(torch.linalg.cross(up, L), dim=0)
+                e2 = torch.linalg.cross(L, e1)
+                rel = P - P[round(aim_y * (h - 1)), round(aim_x * (w - 1))]
+                g = relight_gobo(lt.get("gobo"), rel @ e1, rel @ e2, lt.get("size", 0.05) * size, lt.get("soft", 0.01) * size)
+                s = torch.ones(h, w, device=dev)
+                if lt.get("shadows", True) and L[2] > 0:  # the depth map has no back side to cast shadows from behind
+                    s = 1 - shadow_strength * (1 - gaussian_blur(relight_shadow(P, L)[None, None], 0.006 * h)[0, 0])
+                half = F.normalize(L + torch.tensor([0.0, 0.0, 1.0], device=dev), dim=0)
+                spec = gloss * (nrm @ half).clamp(min=0) ** 40 * (lam > 0)
+                shade += torch.tensor(lt["color"], device=dev) * lt["power"] * power * ((lam + spec) * g * s)[..., None]
+            # The lights fade much faster than the ambient on the far background, so a slit or window leaves only a faint spill on the wall.
+            falloff = background + (1 - background) * smoothstep(0.2, 0.3, d)[..., None]
+            shade = (torch.tensor(cfg["ambient"], device=dev) + shade * falloff ** 2) * falloff
+            relit[i] = linear_to_srgb(srgb_to_linear(image[i].to(dev, torch.float32)) * shade).to(relit.device, relit.dtype)
+            light_map[i] = linear_to_srgb(shade / (1 + shade) * 1.6).to(light_map.device, light_map.dtype)
+        return (relit, light_map, words)
+
+
 NODE_CLASS_MAPPINGS = {"H3OneClickSwapPlan": H3OneClickSwapPlan, "H3AdvancedSwapPlan": H3AdvancedSwapPlan, "H3PictureSwapPlan": H3PictureSwapPlan, "H3SceneSwapPlan": H3SceneSwapPlan, "H3GreyMannequins": H3GreyMannequins,
                        "H3PeopleMask": H3PeopleMask, "H3ClipShots": H3ClipShots, "H3FillShots": H3FillShots,
                        "H3TrackCrops": H3TrackCrops, "H3TrackRoles": H3TrackRoles, "H3RoleMask": H3RoleMask, "H3SubjectPrompt": H3SubjectPrompt,
                        "H3MontagePeople": H3MontagePeople, "H3MontagePlan": H3MontagePlan, "H3MontagePass": H3MontagePass,
                        "H3MontageTracks": H3MontageTracks, "H3MontagePicks": H3MontagePicks, "H3ObjectSwapPlan": H3ObjectSwapPlan, "H3SoundtrackOrSilence": H3SoundtrackOrSilence, "H3SourceSlice": H3SourceSlice,
-                       "H3ObjectPlacementMask": H3ObjectPlacementMask, "H3AddFitCheck": H3AddFitCheck, "H3AddMovingArea": H3AddMovingArea, "H3PaintedEditArea": H3PaintedEditArea, "H3FaceChunks": H3FaceChunks, "H3FaceJoin": H3FaceJoin}
+                       "H3ObjectPlacementMask": H3ObjectPlacementMask, "H3AddFitCheck": H3AddFitCheck, "H3AddMovingArea": H3AddMovingArea, "H3PaintedEditArea": H3PaintedEditArea, "H3FaceChunks": H3FaceChunks, "H3FaceJoin": H3FaceJoin, "H3RelightPass": H3RelightPass}
 NODE_DISPLAY_NAME_MAPPINGS = {"H3OneClickSwapPlan": "H3 One-Click Swap Plan", "H3AdvancedSwapPlan": "H3 Advanced Swap Plan (labelled roles)",
                               "H3PictureSwapPlan": "H3 Picture Swap Plan (person + setting from the picture)", "H3SceneSwapPlan": "H3 Scene Swap Plan (picture + motion)",
                               "H3GreyMannequins": "H3 Grey Mannequins (hide people)", "H3PeopleMask": "H3 People Mask (headroom per person)",
@@ -1946,4 +2119,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {"H3OneClickSwapPlan": "H3 One-Click Swap Plan", "H
                               "H3ObjectPlacementMask": "H3 Object Placement Mask (keyframed box)", "H3AddFitCheck": "H3 Add Fit Check (does their routine fit the box)",
                               "H3AddMovingArea": "H3 Add Moving Area (follows the copied routine)",
                               "H3PaintedEditArea": "H3 Painted Edit Area (follows tracked mask)",
-                              "H3FaceChunks": "H3 Face Fix Chunks", "H3FaceJoin": "H3 Face Fix Join"}
+                              "H3FaceChunks": "H3 Face Fix Chunks", "H3FaceJoin": "H3 Face Fix Join",
+                              "H3RelightPass": "H3 Relight Pass (virtual lights for Klein)"}
