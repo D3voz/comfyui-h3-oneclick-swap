@@ -1414,6 +1414,8 @@ class H3ClipShots:
 CROP_SIZE = 336
 MAX_CROPS = 12
 MIN_AREA = 0.002
+# an appearance under this share of the biggest subject in its shot is a far-off extra, whatever the vision model called it
+MIN_SUBJECT_SHARE = 0.1
 TRACK_GAP = 12
 # close-ups per appearance: the biggest frame of each third of it, so a turn, a step closer or a lost track shows
 VIEWS = 3
@@ -1449,6 +1451,18 @@ def mask_box(m):
 
 def together(segs, i, j):
     return j in segs[i]["with"]
+
+
+def clear_far_extras(segs, labels):
+    """Set appearances far smaller than the biggest subject of their shot back to other: the vision model can name small
+    people in the background as a subject, and each one would become a mannequin."""
+    biggest = {}
+    for s, l in zip(segs, labels):
+        if l["role"]:
+            biggest[s["shot"]] = max(biggest.get(s["shot"], 0), s["area"])
+    for s, l in zip(segs, labels):
+        if s["area"] < MIN_SUBJECT_SHARE * biggest.get(s["shot"], 0):
+            l["role"] = 0
 
 
 def track_prompt(data, batch, known):
@@ -1681,6 +1695,7 @@ class H3TrackRoles:
                     best = max(free, key=lambda r: sim(segs[j]["colour"], protos[r]))
                     if sim(segs[j]["colour"], protos[best]) > sim(segs[j]["colour"], protos[k]):
                         labels[j]["role"] = best
+        clear_far_extras(segs, labels)
         return (json.dumps(labels),)
 
 
